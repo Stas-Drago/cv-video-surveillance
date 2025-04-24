@@ -6,7 +6,7 @@ from datetime import datetime
 import streamlit as st
 from threading import Thread, Lock
 import queue
-import numpy as np
+
 
 # Конфигурация разрешения
 TARGET_WIDTH = 864  # Кратно 32
@@ -16,8 +16,8 @@ TARGET_HEIGHT = 480  # Кратно 32
 model = YOLO("yolov8n.pt")  # Убедитесь что файл модели существует
 
 # RTSP-URL для камер
-RTSP_URL_1 = "rtsp://user:L1k7zmWj@192.168.4.65:554/Streaming/Channels/101"
-RTSP_URL_2 = "rtsp://user:0704RRrr@192.168.14.92:554/Streaming/Channels/101"
+RTSP_URL_1 = "rtsp://user:0704RRrr@192.168.4.65:554/Streaming/Channels/101"
+RTSP_URL_2 = "rtsp://user:L1k7zmWj@192.168.14.92:554/Streaming/Channels/101"
 
 # Блокировки и очереди
 db_lock = Lock()
