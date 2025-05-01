@@ -1,9 +1,11 @@
 from ultralytics import YOLO
 import cv2
 import numpy as np
+import torch
 
 # === Шаг 1: Загрузка модели YOLOv8 ===
-model = YOLO("yolov8n.pt")  # Используйте yolov8n.pt или другую предобученную модель
+# В загрузке модели укажите устройство
+model = YOLO("yolov8m.pt").to('cuda' if torch.cuda.is_available() else 'cpu')  # Используйте yolov8n.pt или другую предобученную модель
 
 # === Шаг 2: Определение маски двора ===
 def create_courtyard_mask(image_shape, polygon):
@@ -50,24 +52,31 @@ def process_frame(frame, mask, polygon):
     return frame
 
 # === Шаг 4: Ввод координат границ через терминал ===
-def input_polygon():
+def select_polygon(image):
     """
-    Запрашивает у пользователя координаты вершин полигона через терминал.
-    :return: Список координат вершин полигона
+    Позволяет пользователю нарисовать полигон на изображении
+    :param image: Исходное изображение
+    :return: Список точек полигона
     """
-    print("Введите координаты вершин полигона (x, y). Для завершения ввода введите 'done'.")
     polygon = []
+    
+    def mouse_callback(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            polygon.append((x, y))
+            cv2.circle(image, (x, y), 5, (0, 255, 0), -1)
+            cv2.imshow("Draw Polygon", image)
+            
+    cv2.namedWindow("Draw Polygon")
+    cv2.setMouseCallback("Draw Polygon", mouse_callback)
+    
     while True:
-        user_input = input(f"Введите координаты вершины {len(polygon) + 1} (например, 'x,y'): ")
-        if user_input.lower() == "done":
+        cv2.imshow("Draw Polygon", image)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
-        try:
-            x, y = map(int, user_input.split(","))
-            polygon.append([x, y])
-        except ValueError:
-            print("Ошибка: Неверный формат координат. Введите координаты в формате 'x,y'.")
+            
+    cv2.destroyAllWindows()
     return polygon
-
 # === Шаг 5: Основной цикл программы ===
 def main():
     # RTSP-адрес камеры
@@ -92,7 +101,7 @@ def main():
     print(f"Размер изображения: {width}*{height} пикселей")
 
     # Ввод координат границ через терминал
-    polygon = input_polygon()
+    polygon = select_polygon(first_frame.copy())
 
     # Создание маски двора
     mask = create_courtyard_mask((height, width), polygon)
@@ -100,8 +109,11 @@ def main():
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("Ошибка: Связь с камерой потеряна.")
-            break
+            print("Потеряно соединение, пытаемся переподключиться...")
+            cap.release()
+            cap = cv2.VideoCapture(rtsp_url)
+            continue
+        # ... обработка ...
 
         # Обработка кадра
         processed_frame = process_frame(frame, mask, polygon)
