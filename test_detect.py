@@ -2,17 +2,17 @@ from ultralytics import YOLO
 import cv2
 # Загрузка обученной модели
 model = YOLO("C:\\Users\\Admin\\Desktop\\runs result carbrand\\train\\weights\\best.pt")  # Путь к вашей модели
-"""
-# Инференс на одном изображении
-results = model("C:\\Users\\Admin\\Desktop\\MyWork\\images.jpg")
 
-# Вывод результатов
-for result in results:
-    results[0].show()  # Показать предсказания на изображении
-    results[0].plot()  # Получить изображение с bounding boxes (numpy array"""   
+# # Инференс на одном изображении
+# results = model("C:\\Users\\Admin\\Desktop\\MyWork\\images.jpg")
 
-# Открытие видеофайла
-video_path = "C:\\Users\\Admin\\Desktop\\MyWork\\test4.mp4"
+# # Вывод результатов
+# for result in results:
+#     results[0].show()  # Показать предсказания на изображении
+#     results[0].plot()  # Получить изображение с bounding boxes  
+
+
+video_path = "C:\\Users\\Admin\\Desktop\\MyWork\\test3.mp4"
 cap = cv2.VideoCapture(video_path)
 
 # Проверка успешного открытия
