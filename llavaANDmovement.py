@@ -7,13 +7,26 @@ import ollama
 import tempfile
 from PIL import Image
 
+# === Новая функция для стабильного подключения к MJPEG-потоку ===
+def connect_to_stream(url, max_retries=5, retry_delay=5):
+    """Подключение к видеопотоку с повторными попытками"""
+    for attempt in range(max_retries):
+        cap = cv2.VideoCapture(url)
+        if cap.isOpened():
+            print(f"Успешно подключились к потоку (попытка {attempt + 1})")
+            return cap
+        print(f"Попытка {attempt + 1} подключения не удалась. Повтор через {retry_delay} сек...")
+        cap.release()
+        time.sleep(retry_delay)
+    raise ConnectionError("Не удалось подключиться к видеопотоку")
+
+# === Анализ кадра через LLaVA остаётся без изменений ===
 def analyze_frame_with_llava(frame):
     try:
         with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmpfile:
             img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             img.save(tmpfile.name, format='JPEG')
-            tmpfile_path = tmpfile.name  # Сохраняем путь
-        # Теперь файл закрыт, и мы можем его использовать
+            tmpfile_path = tmpfile.name
         response = ollama.chat(
             model="llava",
             messages=[{
@@ -22,12 +35,13 @@ def analyze_frame_with_llava(frame):
                 "images": [tmpfile_path]
             }]
         )
-        os.unlink(tmpfile_path)  # Удаляем файл после использования
+        os.unlink(tmpfile_path)
         return response["message"]["content"]
     except Exception as e:
         print(f"Ошибка анализа через LLaVA: {e}")
         return "Ошибка анализа"
 
+# === UniqueObjectTracker без изменений ===
 class UniqueObjectTracker:
     def __init__(self, max_age=10):
         self.active_objects = {}  # {obj_id: {'bbox': [x,y,w,h], 'first_seen': timestamp}}
@@ -49,7 +63,6 @@ class UniqueObjectTracker:
         updated = {}
         dets = [(det['bbox'], det['label']) for det in detections]
 
-        # Сопоставление новых детекций с активными объектами
         for det_bbox, label in dets:
             matched = False
             for obj_id, obj_data in self.active_objects.items():
@@ -73,7 +86,6 @@ class UniqueObjectTracker:
                     'analyzed': False
                 }
 
-        # Удаление старых объектов
         for obj_id in list(self.active_objects.keys()):
             if obj_id not in updated:
                 if (datetime.now() - self.active_objects[obj_id]['last_seen']).total_seconds() < self.max_age:
@@ -93,32 +105,36 @@ class UniqueObjectTracker:
         box2Area = w2 * h2
         return interArea / (box1Area + box2Area - interArea)
 
-# === Параметры ===
-VIDEO_PATH = "C:\\Users\\Admin\\Desktop\\MyWork\\test5.mp4"
-MODEL_NAME = "llava"
+# === Настройки ===
+STREAM_URL = "http://192.168.5.35:555/d3s1uCw2?container=mjpeg&stream=main"
+MODEL_PATH = "C:\\Users\\Admin\\Desktop\\MyWork\\yolo11n.pt"
 CONFIDENCE_THRESHOLD = 0.5
-MAX_AGE = 10  # Количество кадров для хранения "исчезнувшего" объекта
+MAX_AGE = 10
 
 # === Инициализация ===
-cap = cv2.VideoCapture(VIDEO_PATH)
-model = YOLO('C:\\Users\\Admin\\Desktop\\MyWork\\yolo11n.pt')  # Убедитесь, что модель доступна
+cap = connect_to_stream(STREAM_URL)  # Подключаемся к видеорегистратору
+model = YOLO(MODEL_PATH)
 tracker = UniqueObjectTracker(max_age=MAX_AGE)
 
 # === Фоновый субтрактор ===
 back_sub = cv2.createBackgroundSubtractorMOG2()
 
-while cap.isOpened():
+# === Основной цикл ===
+while True:
     ret, frame = cap.read()
     if not ret:
-        break
+        print("Ошибка чтения кадра. Повторное подключение...")
+        cap.release()
+        cap = connect_to_stream(STREAM_URL)
+        continue
 
     # === Детекция движения ===
     fg_mask = back_sub.apply(frame)
     _, mask_thresh = cv2.threshold(fg_mask, 180, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4, 4))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask_eroded = cv2.morphologyEx(mask_thresh, cv2.MORPH_OPEN, kernel)
     contours, _ = cv2.findContours(mask_eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    large_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 1000]
+    large_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 500]
 
     if large_contours:
         results = model.track(frame, persist=True, verbose=False, tracker="bytetrack.yaml")
@@ -155,7 +171,7 @@ while cap.isOpened():
 
     # === Отображение ===
     cv2.imshow("Видеоанализ", annotated_frame)
-    if cv2.waitKey(30) & 0xFF == ord('q'):
+    if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 cap.release()

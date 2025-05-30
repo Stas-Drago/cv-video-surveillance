@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Видеонаблюдение с ИИ</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #f7f9fc;
+      color: #333;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      margin: 0;
+      padding: 20px;
+    }
+
+    .container {
+      max-width: 900px;
+      width: 100%;
+      background: #ffffff;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      padding: 30px;
+      text-align: center;
+    }
+
+    h1 {
+      margin-top: 0;
+      font-size: 24px;
+      color: #2c3e50;
+    }
+
+    select, input[type="text"], button {
+      padding: 10px 15px;
+      margin: 10px 0;
+      width: 100%;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      font-size: 16px;
+      transition: border-color 0.3s;
+    }
+
+    select:focus, input[type="text"]:focus {
+      border-color: #3498db;
+      outline: none;
+    }
+
+    button {
+      background-color: #3498db;
+      color: white;
+      border: none;
+      cursor: pointer;
+      font-weight: bold;
+      border-radius: 6px;
+    }
+
+    button:hover {
+      background-color: #2980b9;
+    }
+
+    #video {
+      width: 100%;
+      max-width: 600px;
+      height: auto;
+      border-radius: 8px;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+      margin: 20px auto;
+      display: block;
+    }
+
+    .section {
+      margin: 20px 0;
+    }
+
+    .response-box {
+      margin-top: 10px;
+      border: 1px solid #ddd;
+      padding: 15px;
+      border-radius: 6px;
+      min-height: 60px;
+      background: #f9f9f9;
+      font-style: italic;
+      color: #555;
+    }
+
+    /* Таблица логов */
+    #logTable {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 20px;
+    }
+
+    #logTable th, #logTable td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: left;
+    }
+
+    #logTable th {
+      background-color: #f0f0f0;
+    }
+
+    #logTable tr:hover {
+      background-color: #f9f9f9;
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <h1>Видеонаблюдение с ИИ</h1>
+
+  <!-- Выбор камеры -->
+  <div class="section">
+    <label for="cameraSelect" style="font-weight: bold;">Выберите камеру:</label>
+    <select id="cameraSelect">
+      {% for name in cameras %}
+        <option value="{{ name }}">{{ name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <!-- Видеопоток -->
+  <div class="section">
+    <img id="video" src="/video_feed" alt="Видео поток" />
+  </div>
+
+  <!-- Диалог с моделью -->
+  <div class="section">
+    <label for="questionInput" style="font-weight: bold;">Задайте вопрос о кадре:</label>
+    <input type="text" id="questionInput" placeholder="Например: Опиши, что происходит на этом кадре?" />
+    <button onclick="askModel()">Спросить модель</button>
+    <div class="response-box" id="response">Ответ модели появится здесь</div>
+  </div>
+
+  <!-- Фильтр по времени -->
+  <div class="section">
+    <select id="timeFilter" onchange="fetchLogs()">
+      <option value="all">Все события</option>
+      <option value="10m">Последние 10 минут</option>
+      <option value="1h">Последний час</option>
+      <option value="24h">Последние 24 часа</option>
+    </select>
+  </div>
+
+  <!-- Логи событий -->
+  <div class="section">
+    <h2>Лог событий</h2>
+    <table id="logTable">
+      <thead>
+        <tr>
+          <th>Время</th>
+          <th>Тип объекта</th>
+          <th>ID</th>
+          <th>Ответ модели</th>
+        </tr>
+      </thead>
+      <tbody id="logBody">
+        <tr><td colspan="4">Нет событий</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  // === Выбор камеры ===
+  document.getElementById('cameraSelect').addEventListener('change', function () {
+    const selected = this.value;
+    fetch('/set_camera', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ camera: selected })
+    });
+  });
+
+  // === Диалог с моделью ===
+  function askModel() {
+    const question = document.getElementById('questionInput').value.trim();
+    if (!question) {
+      document.getElementById('response').innerText = "Пожалуйста, введите вопрос.";
+      return;
+    }
+
+    document.getElementById('response').innerText = "Ожидание ответа модели...";
+    fetch('/ask_model', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: question })
+    })
+    .then(res => res.json())
+    .then(data => {
+      document.getElementById('response').innerText = data.answer;
+    })
+    .catch(err => {
+      document.getElementById('response').innerText = "Ошибка: " + err.message;
+    });
+  }
+
+  // === Автообновление логов ===
+  function fetchLogs() {
+    const timeFilter = document.getElementById('timeFilter').value;
+    fetch(`/get_logs?filter=${timeFilter}`)
+      .then(res => res.json())
+      .then(data => {
+        const logBody = document.getElementById('logBody');
+        logBody.innerHTML = ""; // Очистка
+
+        if (data.length === 0) {
+          logBody.innerHTML = "<tr><td colspan='4'>Нет событий</td></tr>";
+          return;
+        }
+
+        data.forEach(entry => {
+          const row = document.createElement("tr");
+
+          row.innerHTML = `
+            <td>${entry.timestamp}</td>
+            <td>${entry.type}</td>
+            <td>${entry.id}</td>
+            <td>${entry.answer}</td>
+          `;
+
+          logBody.appendChild(row);
+        });
+      })
+      .catch(err => {
+        console.error("Ошибка загрузки логов:", err);
+      });
+  }
+
+  // Обновляем логи при изменении фильтра
+  document.getElementById('timeFilter').addEventListener('change', fetchLogs);
+
+  // Первичная загрузка логов
+  window.onload = fetchLogs;
+</script>
+
+</body>
+</html>
