@@ -25,7 +25,8 @@ latest_frame = None
 lock = threading.Lock()
 user_question = "Describe what you see in this frame?"
 question_lock = threading.Lock()
-
+force_reconnect = False
+reconnect_lock = threading.Lock()
 # === Загрузка моделей ===
 model = YOLO('yolo11n.pt')  # Убедитесь, что модель доступна
 back_sub = cv2.createBackgroundSubtractorMOG2()
@@ -125,27 +126,29 @@ def analyze_frame_with_llava(frame, question="Describe what you see in this fram
 
 # === Поток для чтения кадров и анализа ===
 def video_processing_thread():
-    global current_camera_url, latest_frame, active_analysis_objects, user_question
+    global current_camera_url, latest_frame, force_reconnect
     cap = None
 
     while True:
-        if cap is None or not cap.isOpened():
-            print(f"Попытка подключения к: {current_camera_url}")
-            cap = cv2.VideoCapture(current_camera_url)
-            print(f"Формат потока: {cap.get(cv2.CAP_PROP_FORMAT)}")
-            print(f"Подключились к: {current_camera_url}")
+        with reconnect_lock:
+            if force_reconnect or (cap is None or not cap.isOpened()):
+                if cap is not None:
+                    cap.release()
+                print(f"Подключились к: {current_camera_url}")
+                cap = cv2.VideoCapture(current_camera_url)
+                force_reconnect = False  # ✅ Сбрасываем флаг
 
         ret, frame = cap.read()
         if not ret:
-            print("Ошибка чтения кадра, переподключение...")
+            print("Ошибка чтения кадра. Переподключение...")
             cap.release()
+            cap = None
             time.sleep(5)
             continue
 
         # === ВСЕГДА запускаем YOLO ===
         results = model.track(frame, persist=True, verbose=False, tracker="bytetrack.yaml")
         detections = []
-
         if results and hasattr(results[0], 'boxes'):
             for obj in results[0].boxes:
                 x1, y1, x2, y2 = obj.xyxy[0].tolist()
@@ -161,22 +164,18 @@ def video_processing_thread():
                 x, y, w, h = obj_data['bbox']
                 obj_frame = frame[y:y+h, x:x+w]
 
-                # === Запрос к LLaVA ===
                 with question_lock:
                     description = analyze_frame_with_llava(obj_frame, user_question)
                     print(f"Объект ID: {obj_id}, Тип: {obj_data['label']}, Описание: {description}")
 
-                # === Логирование ===
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 log_entry = f"[{timestamp}] Объект ID: {obj_id}, Тип: {obj_data['label']}, Ответ: {description}\n"
                 with open(analysis_log_file, "a", encoding="utf-8") as f:
                     f.write(log_entry)
 
-                # === Помечаем как обработанный ===
                 obj_data['analyzed'] = True
                 tracker.active_objects[obj_id] = obj_data
 
-        # === Рисуем боксы ===
         if results and hasattr(results[0], 'boxes'):
             annotated_frame = results[0].plot()
         else:
@@ -185,7 +184,7 @@ def video_processing_thread():
         with lock:
             latest_frame = annotated_frame
 
-        time.sleep(0.03)  # Ограничение частоты обработки
+        time.sleep(0.03)
 
 @app.route('/')
 def index():
@@ -197,12 +196,14 @@ def video_feed():
 
 @app.route('/set_camera', methods=['POST'])
 def set_camera():
-    global current_camera_url
-    camera_name = request.json.get('camera')
-    if camera_name in CAMERAS:
-        current_camera_url = CAMERAS[camera_name]
-        return jsonify({"status": "success", "camera": camera_name})
-    return jsonify({"status": "error", "message": "Camera not found"}), 400
+    global current_camera_url, force_reconnect
+    with reconnect_lock:
+        camera_name = request.json.get('camera')
+        if camera_name in CAMERAS:
+            current_camera_url = CAMERAS[camera_name]
+            force_reconnect = True  # ✅ Активируем переподключение
+            return jsonify({"status": "success", "camera": camera_name})
+        return jsonify({"status": "error", "message": "Camera not found"}), 400
 
 @app.route('/ask_model', methods=['POST'])
 def ask_model():
