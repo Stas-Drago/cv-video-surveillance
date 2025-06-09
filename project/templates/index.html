@@ -127,13 +127,6 @@
     <img id="video" src="/video_feed" alt="Видео поток" />
   </div>
 
-  <!-- Диалог с моделью -->
-  <div class="section">
-    <label for="questionInput" style="font-weight: bold;">Задайте вопрос о кадре:</label>
-    <input type="text" id="questionInput" placeholder="Например: Опиши, что происходит на этом кадре?" />
-    <button onclick="askModel()">Спросить модель</button>
-    <div class="response-box" id="response">Ответ модели появится здесь</div>
-  </div>
 
   <!-- Фильтр по времени -->
   <div class="section">
@@ -174,29 +167,6 @@
       body: JSON.stringify({ camera: selected })
     });
   });
-
-  // === Диалог с моделью ===
-  function askModel() {
-    const question = document.getElementById('questionInput').value.trim();
-    if (!question) {
-      document.getElementById('response').innerText = "Пожалуйста, введите вопрос.";
-      return;
-    }
-
-    document.getElementById('response').innerText = "Ожидание ответа модели...";
-    fetch('/ask_model', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: question })
-    })
-    .then(res => res.json())
-    .then(data => {
-      document.getElementById('response').innerText = data.answer;
-    })
-    .catch(err => {
-      document.getElementById('response').innerText = "Ошибка: " + err.message;
-    });
-  }
 
   // === Автообновление логов ===
   function fetchLogs() {

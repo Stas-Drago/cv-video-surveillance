@@ -9,14 +9,14 @@ import ollama
 import tempfile
 from PIL import Image
 import time
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
 # === Настройки камер ===
 CAMERAS = {
     "Камера 1": "http://192.168.5.35:555/d3s1uCw2?container=mjpeg&stream=main",
-    "Камера 2": "http://192.168.5.35:555/JZGVXGWS?container=mjpeg&stream=main",
-    "Камера 3": "http://192.168.5.35:555/JZGVXGWS?container=mjpeg&stream=main"
+    "Камера 2": "http://192.168.5.35:555/JZGVXGWS?container=mjpeg&stream=main"
 }
 
 # === Глобальные переменные ===
@@ -107,7 +107,6 @@ def analyze_frame_with_llava(frame, question="Describe what you see in this fram
             img.save(tmpfile.name, format='JPEG')
             tmpfile_path = tmpfile.name
 
-        print(f"Отправляем вопрос модели: {question}")
         response = ollama.chat(
             model="llava",
             messages=[{
@@ -116,7 +115,6 @@ def analyze_frame_with_llava(frame, question="Describe what you see in this fram
                 "images": [tmpfile_path]
             }]
         )
-        print("Ответ модели:", response)
 
         os.unlink(tmpfile_path)
         return response.get("message", {}).get("content", "Нет содержания в ответе")
@@ -166,7 +164,6 @@ def video_processing_thread():
 
                 with question_lock:
                     description = analyze_frame_with_llava(obj_frame, user_question)
-                    print(f"Объект ID: {obj_id}, Тип: {obj_data['label']}, Описание: {description}")
 
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 log_entry = f"[{timestamp}] Объект ID: {obj_id}, Тип: {obj_data['label']}, Ответ: {description}\n"
@@ -204,24 +201,6 @@ def set_camera():
             force_reconnect = True  # ✅ Активируем переподключение
             return jsonify({"status": "success", "camera": camera_name})
         return jsonify({"status": "error", "message": "Camera not found"}), 400
-
-@app.route('/ask_model', methods=['POST'])
-def ask_model():
-    global latest_frame
-    question = request.json.get('question', "Describe what you see in this frame?")
-    
-    if latest_frame is None:
-        print("Ошибка: latest_frame == None")
-        return jsonify({"answer": "Кадр не доступен для анализа"})
-    
-    try:
-        answer = analyze_frame_with_llava(latest_frame, question)
-        return jsonify({"answer": answer})
-    except Exception as e:
-        print(f"Ошибка при анализе кадра: {e}")
-        return jsonify({"answer": "Произошла ошибка при анализе кадра"})
-    
-from datetime import datetime, timedelta
 
 @app.route('/get_logs')
 def get_logs():
