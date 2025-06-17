@@ -15,7 +15,6 @@
       margin: 0;
       padding: 20px;
     }
-
     .container {
       max-width: 900px;
       width: 100%;
@@ -25,14 +24,12 @@
       padding: 30px;
       text-align: center;
     }
-
     h1 {
       margin-top: 0;
       font-size: 24px;
       color: #2c3e50;
     }
-
-    select, input[type="text"], button {
+    select, input[type="number"], input[type="text"], input[type="datetime-local"], button {
       padding: 10px 15px;
       margin: 10px 0;
       width: 100%;
@@ -41,12 +38,10 @@
       font-size: 16px;
       transition: border-color 0.3s;
     }
-
-    select:focus, input[type="text"]:focus {
+    select:focus, input:focus {
       border-color: #3498db;
       outline: none;
     }
-
     button {
       background-color: #3498db;
       color: white;
@@ -55,11 +50,9 @@
       font-weight: bold;
       border-radius: 6px;
     }
-
     button:hover {
       background-color: #2980b9;
     }
-
     #video {
       width: 100%;
       max-width: 600px;
@@ -69,11 +62,9 @@
       margin: 20px auto;
       display: block;
     }
-
     .section {
       margin: 20px 0;
     }
-
     .response-box {
       margin-top: 10px;
       border: 1px solid #ddd;
@@ -84,34 +75,28 @@
       font-style: italic;
       color: #555;
     }
-
     /* Таблица логов */
     #logTable {
       width: 100%;
       border-collapse: collapse;
       margin-top: 20px;
     }
-
     #logTable th, #logTable td {
       border: 1px solid #ddd;
       padding: 8px;
       text-align: left;
     }
-
     #logTable th {
       background-color: #f0f0f0;
     }
-
     #logTable tr:hover {
       background-color: #f9f9f9;
     }
   </style>
 </head>
 <body>
-
 <div class="container">
   <h1>Видеонаблюдение с ИИ</h1>
-
   <!-- Выбор камеры -->
   <div class="section">
     <label for="cameraSelect" style="font-weight: bold;">Выберите камеру:</label>
@@ -121,23 +106,47 @@
       {% endfor %}
     </select>
   </div>
-
   <!-- Видеопоток -->
   <div class="section">
     <img id="video" src="/video_feed" alt="Видео поток" />
   </div>
-
-
-  <!-- Фильтр по времени -->
+  <!-- Форма фильтрации -->
   <div class="section">
-    <select id="timeFilter" onchange="fetchLogs()">
-      <option value="all">Все события</option>
-      <option value="10m">Последние 10 минут</option>
-      <option value="1h">Последний час</option>
-      <option value="24h">Последние 24 часа</option>
-    </select>
-  </div>
+    <h2>Фильтр по логам</h2>
+    <form id="filterForm">
+      <label>За последние (минут):</label>
+      <input type="number" id="minutesFilter" placeholder="Например: 60" />
 
+      <label>Начало временного промежутка:</label>
+      <input type="datetime-local" id="startTimeFilter" />
+
+      <label>Конец временного промежутка:</label>
+      <input type="datetime-local" id="endTimeFilter" />
+
+      <label>Камера:</label>
+      <select id="cameraFilter">
+        <option value="">Все</option>
+        {% for name in cameras %}
+          <option value="{{ name }}">{{ name }}</option>
+        {% endfor %}
+      </select>
+
+      <label>Тип объекта:</label>
+      <select id="typeFilter">
+        <option value="">Все</option>
+        <option value="person">Человек</option>
+        <option value="car">Автомобиль</option>
+        <option value="truck">Грузовой автомобиль</option>
+        <option value="bus">Автобус</option>
+        <option value="motorcycle">Мотоцикл</option>
+      </select>
+
+      <label>Ключевое слово в описании:</label>
+      <input type="text" id="keywordFilter" placeholder="Например: коробка" />
+
+      <button type="submit">Поиск</button>
+    </form>
+  </div>
   <!-- Логи событий -->
   <div class="section">
     <h2>Лог событий</h2>
@@ -145,13 +154,14 @@
       <thead>
         <tr>
           <th>Время</th>
+          <th>Камера</th>
           <th>Тип объекта</th>
           <th>ID</th>
           <th>Ответ модели</th>
         </tr>
       </thead>
       <tbody id="logBody">
-        <tr><td colspan="4">Нет событий</td></tr>
+        <tr><td colspan="5">Нет событий</td></tr>
       </tbody>
     </table>
   </div>
@@ -168,44 +178,50 @@
     });
   });
 
-  // === Автообновление логов ===
-  function fetchLogs() {
-    const timeFilter = document.getElementById('timeFilter').value;
-    fetch(`/get_logs?filter=${timeFilter}`)
+  // === Поиск по фильтрам ===
+  document.getElementById('filterForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+
+    const minutes = document.getElementById('minutesFilter').value;
+    const startTime = document.getElementById('startTimeFilter').value;
+    const endTime = document.getElementById('endTimeFilter').value;
+    const camera = document.getElementById('cameraFilter').value;
+    const type = document.getElementById('typeFilter').value;
+    const keyword = document.getElementById('keywordFilter').value;
+
+    let url = '/search_logs?';
+    if (minutes) url += `time=${encodeURIComponent(minutes)}&`;
+    if (startTime) url += `start_time=${encodeURIComponent(startTime)}&`;
+    if (endTime) url += `end_time=${encodeURIComponent(endTime)}&`;
+    if (camera) url += `camera=${encodeURIComponent(camera)}&`;
+    if (type) url += `type=${encodeURIComponent(type)}&`;
+    if (keyword) url += `keyword=${encodeURIComponent(keyword)}&`;
+
+    fetch(url)
       .then(res => res.json())
       .then(data => {
         const logBody = document.getElementById('logBody');
-        logBody.innerHTML = ""; // Очистка
-
+        logBody.innerHTML = "";
         if (data.length === 0) {
-          logBody.innerHTML = "<tr><td colspan='4'>Нет событий</td></tr>";
+          logBody.innerHTML = "<tr><td colspan='5'>Нет совпадений</td></tr>";
           return;
         }
-
         data.forEach(entry => {
           const row = document.createElement("tr");
-
           row.innerHTML = `
             <td>${entry.timestamp}</td>
+            <td>${entry.camera}</td>
             <td>${entry.type}</td>
-            <td>${entry.id}</td>
+            <td>${entry.obj_id}</td>
             <td>${entry.answer}</td>
           `;
-
           logBody.appendChild(row);
         });
       })
       .catch(err => {
-        console.error("Ошибка загрузки логов:", err);
+        console.error("Ошибка поиска:", err);
       });
-  }
-
-  // Обновляем логи при изменении фильтра
-  document.getElementById('timeFilter').addEventListener('change', fetchLogs);
-
-  // Первичная загрузка логов
-  window.onload = fetchLogs;
+  });
 </script>
-
 </body>
 </html>

@@ -10,6 +10,7 @@ import tempfile
 from PIL import Image
 import time
 from datetime import datetime, timedelta
+import sqlite3
 
 app = Flask(__name__)
 
@@ -27,6 +28,7 @@ user_question = "Describe what you see in this frame?"
 question_lock = threading.Lock()
 force_reconnect = False
 reconnect_lock = threading.Lock()
+
 # === Загрузка моделей ===
 model = YOLO('yolo11n.pt')  # Убедитесь, что модель доступна
 back_sub = cv2.createBackgroundSubtractorMOG2()
@@ -97,8 +99,35 @@ class UniqueObjectTracker:
 
 # === Глобальные переменные для анализа ===
 active_analysis_objects = {}  # Хранение объектов, которые нужно проанализировать
-analysis_log_file = "analysis_log.txt"
 tracker = UniqueObjectTracker(max_age=10)
+
+# === Создание БД и таблицы ===
+def init_db():
+    conn = sqlite3.connect('surveillance.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS logs
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  timestamp TEXT,
+                  camera TEXT,
+                  obj_type TEXT,
+                  obj_id INTEGER,
+                  answer TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# === Логирование в БД ===
+def log_analysis(obj_id, obj_type, description):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    camera_name = next(key for key, value in CAMERAS.items() if value == current_camera_url)
+    conn = sqlite3.connect('surveillance.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO logs (timestamp, camera, obj_type, obj_id, answer) VALUES (?, ?, ?, ?, ?)",
+              (timestamp, camera_name, obj_type, obj_id, description))
+    conn.commit()
+    conn.close()
+
 # === Анализ кадра через LLaVA ===
 def analyze_frame_with_llava(frame, question="Describe what you see in this frame?"):
     try:
@@ -106,7 +135,6 @@ def analyze_frame_with_llava(frame, question="Describe what you see in this fram
             img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             img.save(tmpfile.name, format='JPEG')
             tmpfile_path = tmpfile.name
-
         response = ollama.chat(
             model="llava",
             messages=[{
@@ -115,7 +143,6 @@ def analyze_frame_with_llava(frame, question="Describe what you see in this fram
                 "images": [tmpfile_path]
             }]
         )
-
         os.unlink(tmpfile_path)
         return response.get("message", {}).get("content", "Нет содержания в ответе")
     except Exception as e:
@@ -126,7 +153,6 @@ def analyze_frame_with_llava(frame, question="Describe what you see in this fram
 def video_processing_thread():
     global current_camera_url, latest_frame, force_reconnect
     cap = None
-
     while True:
         with reconnect_lock:
             if force_reconnect or (cap is None or not cap.isOpened()):
@@ -135,7 +161,6 @@ def video_processing_thread():
                 print(f"Подключились к: {current_camera_url}")
                 cap = cv2.VideoCapture(current_camera_url)
                 force_reconnect = False  # ✅ Сбрасываем флаг
-
         ret, frame = cap.read()
         if not ret:
             print("Ошибка чтения кадра. Переподключение...")
@@ -143,7 +168,6 @@ def video_processing_thread():
             cap = None
             time.sleep(5)
             continue
-
         # === ВСЕГДА запускаем YOLO ===
         results = model.track(frame, persist=True, verbose=False, tracker="bytetrack.yaml")
         detections = []
@@ -153,34 +177,23 @@ def video_processing_thread():
                 bbox = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
                 label = model.names[int(obj.cls)]
                 detections.append((bbox, label))
-
         tracked_objects = tracker.update(detections)
-
         # === Анализ новых объектов ===
         for obj_id, obj_data in tracked_objects.items():
             if not obj_data.get('analyzed', False):
                 x, y, w, h = obj_data['bbox']
                 obj_frame = frame[y:y+h, x:x+w]
-
                 with question_lock:
                     description = analyze_frame_with_llava(obj_frame, user_question)
-
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                log_entry = f"[{timestamp}] Объект ID: {obj_id}, Тип: {obj_data['label']}, Ответ: {description}\n"
-                with open(analysis_log_file, "a", encoding="utf-8") as f:
-                    f.write(log_entry)
-
+                log_analysis(obj_id, obj_data['label'], description)
                 obj_data['analyzed'] = True
                 tracker.active_objects[obj_id] = obj_data
-
         if results and hasattr(results[0], 'boxes'):
             annotated_frame = results[0].plot()
         else:
             annotated_frame = frame.copy()
-
         with lock:
             latest_frame = annotated_frame
-
         time.sleep(0.03)
 
 @app.route('/')
@@ -202,53 +215,56 @@ def set_camera():
             return jsonify({"status": "success", "camera": camera_name})
         return jsonify({"status": "error", "message": "Camera not found"}), 400
 
-@app.route('/get_logs')
-def get_logs():
-    try:
-        filter_param = request.args.get('filter', 'all')
-        current_time = datetime.now()
+@app.route('/search_logs', methods=['GET'])
+def search_logs():
+    time_filter = request.args.get('time', '')
+    start_time = request.args.get('start_time', '')
+    end_time = request.args.get('end_time', '')
+    obj_type = request.args.get('type', '')
+    keyword = request.args.get('keyword', '').lower()
+    camera = request.args.get('camera', '')
 
-        with open("analysis_log.txt", "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            logs = []
-            for line in lines:
-                if "Объект ID:" in line:
-                    parts = line.strip().split("] ")
-                    timestamp_str = parts[0].replace("[", "").replace("]", "")
-                    rest = parts[1]
-                    try:
-                        obj_id = rest.split("ID:")[1].split(",")[0].strip()
-                        obj_type = rest.split("Тип:")[1].split(",")[0].strip()
-                        answer = rest.split("Ответ:")[1].strip()
-                    except IndexError:
-                        continue
+    query = "SELECT * FROM logs WHERE 1=1"
+    params = []
 
-                    # Парсим время события
-                    event_time = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
-                    keep = True
+    if time_filter:
+        try:
+            minutes = int(time_filter)
+            cutoff = datetime.now() - timedelta(minutes=minutes)
+            query += " AND timestamp >= ?"
+            params.append(cutoff.strftime("%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            pass
 
-                    if filter_param == "10m":
-                        keep = (current_time - event_time) < timedelta(minutes=10)
-                    elif filter_param == "1h":
-                        keep = (current_time - event_time) < timedelta(hours=1)
-                    elif filter_param == "24h":
-                        keep = (current_time - event_time) < timedelta(days=1)
+    if start_time:
+        query += " AND timestamp >= ?"
+        params.append(start_time)
+    if end_time:
+        query += " AND timestamp <= ?"
+        params.append(end_time)
 
-                    if keep:
-                        logs.append({
-                            "timestamp": timestamp_str,
-                            "type": obj_type,
-                            "id": obj_id,
-                            "answer": answer
-                        })
+    if obj_type:
+        query += " AND obj_type = ?"
+        params.append(obj_type)
 
-            # Сортируем по времени (новые сверху)
-            logs.sort(key=lambda x: x['timestamp'], reverse=True)
-            return jsonify(logs)
-    except Exception as e:
-        print(f"Ошибка чтения логов: {e}")
-        return jsonify([])
-    
+    if keyword:
+        query += " AND answer LIKE ?"
+        params.append(f"%{keyword}%")
+
+    if camera:
+        query += " AND camera = ?"
+        params.append(camera)
+
+    conn = sqlite3.connect('surveillance.db')
+    c = conn.cursor()
+    c.execute(query, params)
+    rows = c.fetchall()
+    conn.close()
+
+    logs = [{"timestamp": r[1], "camera": r[2], "type": r[3], "obj_id": r[4], "answer": r[5]} for r in rows]
+    logs.sort(key=lambda x: x['timestamp'], reverse=True)
+    return jsonify(logs)
+
 # === MJPEG поток ===
 def generate_frames():
     global latest_frame
