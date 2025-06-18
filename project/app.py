@@ -21,13 +21,14 @@ CAMERAS = {
 }
 
 # === Глобальные переменные ===
-current_camera_url = list(CAMERAS.values())[0]
-latest_frame = None
-lock = threading.Lock()
+camera_threads = {}
+latest_frames = {}
+lock_objects = {camera: threading.Lock() for camera in CAMERAS}
+force_reconnect_flags = {camera: False for camera in CAMERAS}
+reconnect_lock = threading.Lock()
+
 user_question = "Describe what you see in this frame?"
 question_lock = threading.Lock()
-force_reconnect = False
-reconnect_lock = threading.Lock()
 
 # === Загрузка моделей ===
 model = YOLO('yolo11n.pt')  # Убедитесь, что модель доступна
@@ -97,10 +98,6 @@ class UniqueObjectTracker:
         box2Area = w2 * h2
         return interArea / (box1Area + box2Area - interArea)
 
-# === Глобальные переменные для анализа ===
-active_analysis_objects = {}  # Хранение объектов, которые нужно проанализировать
-tracker = UniqueObjectTracker(max_age=10)
-
 # === Создание БД и таблицы ===
 def init_db():
     conn = sqlite3.connect('surveillance.db')
@@ -118,9 +115,8 @@ def init_db():
 init_db()
 
 # === Логирование в БД ===
-def log_analysis(obj_id, obj_type, description):
+def log_analysis(camera_name, obj_id, obj_type, description):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    camera_name = next(key for key, value in CAMERAS.items() if value == current_camera_url)
     conn = sqlite3.connect('surveillance.db')
     c = conn.cursor()
     c.execute("INSERT INTO logs (timestamp, camera, obj_type, obj_id, answer) VALUES (?, ?, ?, ?, ?)",
@@ -149,35 +145,39 @@ def analyze_frame_with_llava(frame, question="Describe what you see in this fram
         print(f"Ошибка анализа через LLaVA: {e}")
         return f"Ошибка анализа: {e}"
 
-# === Поток для чтения кадров и анализа ===
-def video_processing_thread():
-    global current_camera_url, latest_frame, force_reconnect
+# === Поток для обработки одной камеры ===
+def camera_processing_thread(camera_name, camera_url):
+    local_model = YOLO('yolo11n.pt')  # Загрузка модели внутри потока
+    tracker = UniqueObjectTracker(max_age=10)
     cap = None
     while True:
         with reconnect_lock:
-            if force_reconnect or (cap is None or not cap.isOpened()):
+            if force_reconnect_flags[camera_name] or (cap is None or not cap.isOpened()):
                 if cap is not None:
                     cap.release()
-                print(f"Подключились к: {current_camera_url}")
-                cap = cv2.VideoCapture(current_camera_url)
-                force_reconnect = False  # ✅ Сбрасываем флаг
+                print(f"[{camera_name}] Подключились к: {camera_url}")
+                cap = cv2.VideoCapture(camera_url)
+                force_reconnect_flags[camera_name] = False
+        
         ret, frame = cap.read()
         if not ret:
-            print("Ошибка чтения кадра. Переподключение...")
+            print(f"[{camera_name}] Ошибка чтения кадра. Переподключение...")
             cap.release()
             cap = None
             time.sleep(5)
             continue
-        # === ВСЕГДА запускаем YOLO ===
-        results = model.track(frame, persist=True, verbose=False, tracker="bytetrack.yaml")
+
+        results = local_model.track(frame, persist=True, verbose=False, tracker="bytetrack.yaml")
         detections = []
         if results and hasattr(results[0], 'boxes'):
             for obj in results[0].boxes:
                 x1, y1, x2, y2 = obj.xyxy[0].tolist()
                 bbox = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
-                label = model.names[int(obj.cls)]
+                label = local_model.names[int(obj.cls)]
                 detections.append((bbox, label))
+        
         tracked_objects = tracker.update(detections)
+        
         # === Анализ новых объектов ===
         for obj_id, obj_data in tracked_objects.items():
             if not obj_data.get('analyzed', False):
@@ -185,15 +185,18 @@ def video_processing_thread():
                 obj_frame = frame[y:y+h, x:x+w]
                 with question_lock:
                     description = analyze_frame_with_llava(obj_frame, user_question)
-                log_analysis(obj_id, obj_data['label'], description)
+                log_analysis(camera_name, obj_id, obj_data['label'], description)
                 obj_data['analyzed'] = True
                 tracker.active_objects[obj_id] = obj_data
+        
         if results and hasattr(results[0], 'boxes'):
             annotated_frame = results[0].plot()
         else:
             annotated_frame = frame.copy()
-        with lock:
-            latest_frame = annotated_frame
+        
+        with lock_objects[camera_name]:
+            latest_frames[camera_name] = annotated_frame
+        
         time.sleep(0.03)
 
 @app.route('/')
@@ -202,18 +205,29 @@ def index():
 
 @app.route('/video_feed')
 def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    camera_name = request.args.get('camera', '')
+    if camera_name not in CAMERAS:
+        return "Camera not found", 404
+    
+    def generate(camera):
+        while True:
+            frame = latest_frames.get(camera, None)
+            if frame is not None:
+                ret, buffer = cv2.imencode('.jpg', frame)
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            time.sleep(0.03)
+    
+    return Response(generate(camera_name), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/set_camera', methods=['POST'])
 def set_camera():
-    global current_camera_url, force_reconnect
-    with reconnect_lock:
-        camera_name = request.json.get('camera')
-        if camera_name in CAMERAS:
-            current_camera_url = CAMERAS[camera_name]
-            force_reconnect = True  # ✅ Активируем переподключение
-            return jsonify({"status": "success", "camera": camera_name})
-        return jsonify({"status": "error", "message": "Camera not found"}), 400
+    camera_name = request.json.get('camera')
+    if camera_name in CAMERAS:
+        force_reconnect_flags[camera_name] = True
+        return jsonify({"status": "success", "camera": camera_name})
+    return jsonify({"status": "error", "message": "Camera not found"}), 400
 
 @app.route('/search_logs', methods=['GET'])
 def search_logs():
@@ -265,18 +279,15 @@ def search_logs():
     logs.sort(key=lambda x: x['timestamp'], reverse=True)
     return jsonify(logs)
 
-# === MJPEG поток ===
-def generate_frames():
-    global latest_frame
-    while True:
-        if latest_frame is not None:
-            ret, buffer = cv2.imencode('.jpg', latest_frame)
-            if ret:
-                frame = buffer.tobytes()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        time.sleep(0.03)
-
 if __name__ == '__main__':
-    threading.Thread(target=video_processing_thread, daemon=True).start()
+    # Запускаем обработку для каждой камеры в отдельном потоке
+    for camera_name, camera_url in CAMERAS.items():
+        thread = threading.Thread(
+            target=camera_processing_thread,
+            args=(camera_name, camera_url),
+            daemon=True
+        )
+        thread.start()
+        camera_threads[camera_name] = thread
+    
     app.run(host='0.0.0.0', port=8090, debug=True)
