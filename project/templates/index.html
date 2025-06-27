@@ -1,23 +1,18 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
+  <meta charset="UTF-8" />
   <title>Видеонаблюдение с ИИ</title>
   <style>
     body {
       font-family: Arial, sans-serif;
       background-color: #f7f9fc;
-      color: #333;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
       margin: 0;
       padding: 20px;
     }
     .container {
       max-width: 1200px;
-      width: 100%;
+      margin: 0 auto;
       background: #ffffff;
       border-radius: 12px;
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
@@ -25,10 +20,12 @@
       text-align: center;
     }
     h1 {
+      text-align: center;
       margin-top: 0;
       font-size: 24px;
       color: #2c3e50;
     }
+    /* Сетка для камер */
     .grid-container {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -56,7 +53,8 @@
       box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
       transition: all 0.3s ease;
     }
-    .expanded {
+    /* Стили для увеличенного режима */
+    .camera-box.expanded {
       position: fixed;
       top: 0;
       left: 0;
@@ -69,6 +67,11 @@
       align-items: center;
       justify-content: center;
       padding: 0;
+    }
+    .camera-box.expanded .camera-video {
+      max-width: 90vw;
+      max-height: 80vh;
+      box-shadow: 0 0 20px rgba(0, 0, 0, 0.7);
     }
     .close-btn {
       position: absolute;
@@ -90,6 +93,7 @@
     .expanded .close-btn {
       display: block;
     }
+    /* Форма фильтрации и результаты */
     .section {
       margin: 30px 0;
       background: #ffffff;
@@ -158,18 +162,14 @@
     #logTable tr:hover {
       background-color: #f9f9f9;
     }
-    .sql-output {
-      margin-top: 15px;
-      padding: 10px;
-      background: #f0f0f0;
+    .analysis-result {
+      margin-top: 20px;
+      padding: 15px;
+      background: #e8f4ff;
       border-left: 4px solid #3498db;
-      font-family: monospace;
+      font-style: italic;
       white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .error-message {
-      color: #e74c3c;
-      margin-top: 15px;
+      text-align: left;
     }
   </style>
 </head>
@@ -193,25 +193,18 @@
     <h2>Фильтр по логам</h2>
     <form id="filterForm">
       <div class="filter-row">
-        <!-- За последние (минут) -->
         <div class="filter-group">
           <label>За последние (минут):</label>
           <input type="number" id="minutesFilter" placeholder="Например: 60" />
         </div>
-
-        <!-- Начало временного промежутка -->
         <div class="filter-group">
           <label>Начало временного промежутка:</label>
           <input type="datetime-local" id="startTimeFilter" />
         </div>
-
-        <!-- Конец временного промежутка -->
         <div class="filter-group">
           <label>Конец временного промежутка:</label>
           <input type="datetime-local" id="endTimeFilter" />
         </div>
-
-        <!-- Камера -->
         <div class="filter-group">
           <label>Камера:</label>
           <select id="cameraFilter">
@@ -224,7 +217,6 @@
       </div>
       
       <div class="filter-row">
-        <!-- Тип объекта -->
         <div class="filter-group">
           <label>Тип объекта:</label>
           <select id="typeFilter">
@@ -236,20 +228,14 @@
             <option value="motorcycle">Мотоцикл</option>
           </select>
         </div>
-
-        <!-- Ключевое слово -->
         <div class="filter-group">
           <label>Ключевое слово в описании:</label>
           <input type="text" id="keywordFilter" placeholder="Например: коробка" />
         </div>
-
-        <!-- Пользовательский запрос -->
         <div class="filter-group">
           <label>Ваш запрос:</label>
-          <input type="text" id="userQuery" placeholder="Например: Покажи все записи за последние 5 минут" />
+          <input type="text" id="userQuery" placeholder="Например: Какие объекты были на камере за последние 5 минут?" />
         </div>
-
-        <!-- Кнопка поиска -->
         <div class="filter-group">
           <button type="submit" style="width: 100%; padding: 12px 15px;">Поиск</button>
         </div>
@@ -257,12 +243,11 @@
     </form>
   </div>
   
-  <!-- Результаты SQL-запроса -->
+  <!-- Результаты анализа и логи -->
   <div class="section">
-    <h2>Результаты поиска</h2>
-    <div class="sql-output" id="generatedSql"></div>
-    <div class="error-message" id="errorMessage"></div>
-    
+    <h2>Анализ данных</h2>
+    <div class="analysis-result" id="analysisResult">Модель ещё не проанализировала данные.</div>
+    <h2>Лог событий</h2>
     <table id="logTable">
       <thead>
         <tr>
@@ -281,17 +266,7 @@
 </div>
 
 <script>
-  // === Выбор камеры ===
-  document.getElementById('cameraSelect')?.addEventListener('change', function () {
-    const selected = this.value;
-    fetch('/set_camera', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ camera: selected })
-    });
-  });
-
-  // === Форма фильтрации ===
+  // === Обработка формы фильтрации ===
   document.getElementById('filterForm').addEventListener('submit', function (e) {
     e.preventDefault();
     
@@ -310,28 +285,27 @@
     if (camera) url += `camera=${encodeURIComponent(camera)}&`;
     if (type) url += `type=${encodeURIComponent(type)}&`;
     if (keyword) url += `keyword=${encodeURIComponent(keyword)}&`;
-    if (userQuery) url += `query=${encodeURIComponent(userQuery)}&`;
+    if (userQuery) url += `user_query=${encodeURIComponent(userQuery)}&`;
     
     fetch(url)
       .then(res => res.json())
       .then(data => {
         const logBody = document.getElementById('logBody');
-        const generatedSql = document.getElementById('generatedSql');
-        const errorMessage = document.getElementById('errorMessage');
-        
+        const analysisResult = document.getElementById('analysisResult');
         logBody.innerHTML = "";
-        generatedSql.textContent = data.generated_sql;
-        errorMessage.textContent = "";
+        analysisResult.textContent = "";
         
         if (!data.results || data.results.length === 0) {
           logBody.innerHTML = "<tr><td colspan='5'>Нет совпадений</td></tr>";
           return;
         }
         
-        if (!data.success && data.error) {
-          errorMessage.textContent = data.error;
+        // Выводим результат анализа
+        if (data.analysis) {
+          analysisResult.textContent = data.analysis;
         }
         
+        // Выводим таблицу с результатами
         data.results.forEach(entry => {
           const row = document.createElement("tr");
           row.innerHTML = `
@@ -346,7 +320,7 @@
       })
       .catch(err => {
         console.error("Ошибка поиска:", err);
-        document.getElementById('errorMessage').textContent = "Ошибка выполнения поиска";
+        document.getElementById('analysisResult').textContent = "Ошибка выполнения поиска";
       });
   });
 

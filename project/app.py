@@ -145,70 +145,26 @@ def analyze_frame_with_llava(frame, question="Describe what you see in this fram
         print(f"Ошибка анализа через LLaVA: {e}")
         return f"Ошибка анализа: {e}"
 
-# === Генерация SQL-запроса через LLM ===
-def generate_sql_query(user_query):
-    """Генерирует SQL-запрос через LLM модель"""
+# === Анализ результатов через Mistral ===
+def analyze_results_with_mistral(logs, user_query):
+    """Отправляет результаты поиска в Mistral для анализа"""
     try:
-        # Получаем структуру таблицы
-        conn = sqlite3.connect('surveillance.db')
-        c = conn.cursor()
-        c.execute("PRAGMA table_info(logs)")
-        columns = c.fetchall()
-        conn.close()
-        
-        # Формируем контекст для LLM
-        table_structure = "Таблица 'logs' имеет следующие поля:\n"
-        for col in columns:
-            table_structure += f"- {col[1]} ({col[2]})\n"
-        
-        # Описание полей
-        table_description = """
-        Поля таблицы:
-        - id: уникальный идентификатор записи
-        - timestamp: дата и время события
-        - camera: название камеры
-        - obj_type: тип объекта (person, car, truck, bus, motorcycle)
-        - obj_id: ID объекта
-        - answer: описание события от модели
-        """
+        # Формируем контекст для модели
+        context = f"На основе следующих данных из базы наблюдения:\n\n"
+        for entry in logs:
+            context += f"[{entry['timestamp']}] {entry['camera']} — {entry['type']} (ID: {entry['obj_id']}): {entry['answer']}\n"
+        context += f"\nЗапрос пользователя: {user_query}\n\n"
+        context += "Пожалуйста, проанализируйте данные и ответьте на запрос пользователя."
 
-        prompt = f"""{table_structure}{table_description}
-
-        Вы должны сгенерировать SQL-запрос для SQLite, который будет выполнять действия, описанные пользователем.
-        Не добавляйте ничего кроме SQL-запроса в ответ.
-        Если вы не можете понять, какой SQL-запрос сгенерировать, верните пустую строку.
-        Сгенерируйте только SELECT-запросы, не используйте INSERT/UPDATE/DELETE.
-
-        Пользовательский запрос: {user_query}
-
-        SQL-запрос:"""
-        print(prompt)
         response = ollama.chat(
             model="mistral:7b",
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": context}]
         )
         
-        return response.get("message", {}).get("content", "").strip()
+        return response.get("message", {}).get("content", "Модель не смогла проанализировать данные.")
     except Exception as e:
-        print(f"Ошибка генерации SQL-запроса: {e}")
-        return ""
-
-# === Обработка SQL-запроса ===
-def execute_sql_query(sql_query):
-    """Выполняет SQL-запрос и возвращает результат"""
-    try:
-        conn = sqlite3.connect('surveillance.db')
-        c = conn.cursor()
-        c.execute(sql_query)
-        rows = c.fetchall()
-        conn.close()
-        
-        # Преобразуем результат в формат, который можно отправить клиенту
-        columns = [desc[0] for desc in c.description]
-        results = [dict(zip(columns, row)) for row in rows]
-        return {"success": True, "results": results}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+        print(f"Ошибка анализа через Mistral: {e}")
+        return f"Ошибка анализа: {e}"
 
 # === Поток для обработки одной камеры ===
 def camera_processing_thread(camera_name, camera_url):
@@ -233,7 +189,6 @@ def camera_processing_thread(camera_name, camera_url):
             time.sleep(5)
             continue
 
-        # === ВСЕГДА запускаем YOLO ===
         results = local_model.track(frame, persist=True, verbose=False, tracker="bytetrack.yaml")
         detections = []
         if results and hasattr(results[0], 'boxes'):
@@ -282,8 +237,11 @@ def video_feed():
             if frame is not None:
                 ret, buffer = cv2.imencode('.jpg', frame)
                 if ret:
+                    frame_data = buffer.tobytes()
                     yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                           b'Content-Type: image/jpeg\r\n'
+                           b'Content-Length: ' + f"{len(frame_data)}".encode() + b'\r\n'
+                           b'\r\n' + frame_data + b'\r\n')
             time.sleep(0.03)
     
     return Response(generate(camera_name), mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -304,148 +262,53 @@ def search_logs():
     obj_type = request.args.get('type', '')
     keyword = request.args.get('keyword', '').lower()
     camera = request.args.get('camera', '')
-    user_query = request.args.get('query', '')
+    user_query = request.args.get('user_query', '').strip()
 
-    # Если пользователь ввёл свой запрос, то генерируем SQL-запрос
-    if user_query:
-        # Формируем контекст с учетом текущих фильтров
-        context = f"Текущие фильтры:\n"
-        if time_filter:
-            context += f"- За последние {time_filter} минут\n"
-        if start_time:
-            context += f"- Начало: {start_time}\n"
-        if end_time:
-            context += f"- Конец: {end_time}\n"
-        if obj_type:
-            context += f"- Тип объекта: {obj_type}\n"
-        if keyword:
-            context += f"- Ключевое слово: {keyword}\n"
-        if camera:
-            context += f"- Камера: {camera}\n"
-        context += f"\nПользовательский запрос: {user_query}\n"
+    query = "SELECT * FROM logs WHERE 1=1"
+    params = []
 
-        # Генерируем SQL-запрос через LLM
-        sql_prompt = f"""{context} 
-        Таблица 'logs' содержит следующие поля:
-        - id (INTEGER): уникальный идентификатор записи
-        - timestamp (TEXT): дата и время события
-        - camera (TEXT): название камеры
-        - obj_type (TEXT): тип объекта (person, car, truck, bus, motorcycle)
-        - obj_id (INTEGER): ID объекта
-        - answer (TEXT): описание события от модели
-
-        На основе текущих фильтров и пользовательского запроса сгенерируйте SQL-запрос для базы данных SQLite.
-        Не добавляйте ничего кроме SQL-запроса в ответ.
-        Если вы не можете понять, какой SQL-запрос сгенерировать, верните пустую строку.
-        Сгенерируйте только SELECT-запросы, не используйте INSERT/UPDATE/DELETE"""
-        
+    if time_filter:
         try:
-            response = ollama.chat(
-                model="mistral:7b",
-                messages=[{"role": "user", "content": sql_prompt}]
-            )
-            sql_query = response.get("message", {}).get("content", "").strip()
-            
-            # Если LLM не сгенерировал SQL-запрос, используем стандартную фильтрацию
-            if not sql_query:
-                query = "SELECT * FROM logs WHERE 1=1"
-                params = []
-                
-                if time_filter:
-                    try:
-                        minutes = int(time_filter)
-                        cutoff = datetime.now() - timedelta(minutes=minutes)
-                        query += " AND timestamp >= ?"
-                        params.append(cutoff.strftime("%Y-%m-%d %H:%M:%S"))
-                    except ValueError:
-                        pass
-                
-                if start_time:
-                    query += " AND timestamp >= ?"
-                    params.append(start_time)
-                if end_time:
-                    query += " AND timestamp <= ?"
-                    params.append(end_time)
-                if camera:
-                    query += " AND camera = ?"
-                    params.append(camera)
-                if obj_type:
-                    query += " AND obj_type = ?"
-                    params.append(obj_type)
-                if keyword:
-                    query += " AND answer LIKE ?"
-                    params.append(f"%{keyword}%")
-                
-                conn = sqlite3.connect('surveillance.db')
-                c = conn.cursor()
-                c.execute(query, params)
-                rows = c.fetchall()
-                conn.close()
-                
-                logs = [{"timestamp": r[1], "camera": r[2], "type": r[3], "obj_id": r[4], "answer": r[5]} for r in rows]
-                logs.sort(key=lambda x: x['timestamp'], reverse=True)
-                return jsonify({
-                    "generated_sql": "",
-                    "results": logs
-                })
-            else:
-                # Используем SQL-запрос, сгенерированный LLM
-                result = execute_sql_query(sql_query)
-                return jsonify({
-                    "generated_sql": sql_query,
-                    "results": result.get("results", []),
-                    "error": "" if result["success"] else result.get("error", "Неизвестная ошибка")
-                })
-        except Exception as e:
-            # Обрабатываем ошибки при генерации SQL-запроса
-            print(f"Ошибка генерации SQL-запроса: {e}")
-            return jsonify({
-                "generated_sql": "",
-                "results": [],
-                "error": f"Ошибка генерации SQL-запроса: {e}"
-            })
-    else:
-        # Стандартная фильтрация без пользовательского запроса
-        query = "SELECT * FROM logs WHERE 1=1"
-        params = []
-        
-        if time_filter:
-            try:
-                minutes = int(time_filter)
-                cutoff = datetime.now() - timedelta(minutes=minutes)
-                query += " AND timestamp >= ?"
-                params.append(cutoff.strftime("%Y-%m-%d %H:%M:%S"))
-            except ValueError:
-                pass
-        
-        if start_time:
+            minutes = int(time_filter)
+            cutoff = datetime.now() - timedelta(minutes=minutes)
             query += " AND timestamp >= ?"
-            params.append(start_time)
-        if end_time:
-            query += " AND timestamp <= ?"
-            params.append(end_time)
-        if camera:
-            query += " AND camera = ?"
-            params.append(camera)
-        if obj_type:
-            query += " AND obj_type = ?"
-            params.append(obj_type)
-        if keyword:
-            query += " AND answer LIKE ?"
-            params.append(f"%{keyword}%")
-        
-        conn = sqlite3.connect('surveillance.db')
-        c = conn.cursor()
-        c.execute(query, params)
-        rows = c.fetchall()
-        conn.close()
-        
-        logs = [{"timestamp": r[1], "camera": r[2], "type": r[3], "obj_id": r[4], "answer": r[5]} for r in rows]
-        logs.sort(key=lambda x: x['timestamp'], reverse=True)
-        return jsonify({
-            "generated_sql": "",
-            "results": logs
-        })
+            params.append(cutoff.strftime("%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            pass
+
+    if start_time:
+        query += " AND timestamp >= ?"
+        params.append(start_time)
+    if end_time:
+        query += " AND timestamp <= ?"
+        params.append(end_time)
+    if camera:
+        query += " AND camera = ?"
+        params.append(camera)
+    if obj_type:
+        query += " AND obj_type = ?"
+        params.append(obj_type)
+    if keyword:
+        query += " AND answer LIKE ?"
+        params.append(f"%{keyword}%")
+
+    conn = sqlite3.connect('surveillance.db')
+    c = conn.cursor()
+    c.execute(query, params)
+    rows = c.fetchall()
+    conn.close()
+
+    logs = [{"timestamp": r[1], "camera": r[2], "type": r[3], "obj_id": r[4], "answer": r[5]} for r in rows]
+    logs.sort(key=lambda x: x['timestamp'], reverse=True)
+
+    # Если есть пользовательский запрос, отправляем в Mistral
+    if user_query and logs:
+        analysis = analyze_results_with_mistral(logs, user_query)
+        return jsonify({"analysis": analysis, "results": logs})
+    elif user_query and not logs:
+        return jsonify({"analysis": "Нет данных для анализа", "results": []})
+    else:
+        return jsonify({"results": logs})
 
 # === MJPEG поток ===
 def generate_frames():
@@ -456,7 +319,9 @@ def generate_frames():
             if ret:
                 frame = buffer.tobytes()
                 yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                       b'Content-Type: image/jpeg\r\n'
+                       b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
+                       b'\r\n' + frame + b'\r\n')
         time.sleep(0.03)
 
 if __name__ == '__main__':
@@ -470,4 +335,4 @@ if __name__ == '__main__':
         thread.start()
         camera_threads[camera_name] = thread
     
-    app.run(host='0.0.0.0', port=8090, debug=True)
+    app.run(host='0.0.0.0', port=8010, debug=True)
