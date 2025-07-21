@@ -1,23 +1,68 @@
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from flask import Flask, render_template, Response, request, jsonify
 import cv2
 import threading
 from ultralytics import YOLO
-from datetime import datetime
+from datetime import datetime, timedelta
 import ollama
 import tempfile
 from PIL import Image
+import uuid
 import time
-from datetime import datetime, timedelta
 import sqlite3
+import logging
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams, PointStruct
+from openai import OpenAI
 
+
+client = OpenAI(
+  api_key='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjkxMWFmMmEzLWM5YTItNDdmZS05YzQ5LWFjMGQ3ZjAwOTAxYyIsImlzRGV2ZWxvcGVyIjp0cnVlLCJpYXQiOjE3NTE3OTMzMTgsImV4cCI6MjA2NzM2OTMxOH0.4TW93nJ-L5ali4CDg92xsKNfuVgFLlW4DhGSPpoPXu8',
+  base_url='https://bothub.chat/api/v2/openai/v1'
+)
+
+# --- Настройки ---
+QDRANT_HOST = "localhost"
+QDRANT_PORT = 6333
+COLL_NAME = "markdown_collection"
+MARKDOWN_FILE = "logs.md"
+OLLAMA_MODEL = "gemma3:12b-it-qat"
+MISTRAL_MODEL = "mistral-large"
+BI_ENCODER_MODEL = "sentence-transformers/LaBSE"
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-2-v2")
+
+
+# --- Логирование ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# --- Инициализация клиента Qdrant ---
+try:
+    qdrant_client = QdrantClient(QDRANT_HOST, port=QDRANT_PORT)
+    logger.info("Подключились к Qdrant")
+except Exception as e:
+    logger.error(f"Не удалось подключиться к Qdrant: {e}")
+
+
+# --- Инициализация bi-encoder ---
+try:
+    bi_encoder = SentenceTransformer(BI_ENCODER_MODEL, device='cpu')
+    bi_encoder_dim = bi_encoder.get_sentence_embedding_dimension()
+    logger.info(f"Инициализирован bi-encoder LaBSE, размерность: {bi_encoder_dim}")
+except Exception as e:
+    logger.error(f"Ошибка при инициализации bi-encoder: {e}")
+
+
+# --- Flask ---
 app = Flask(__name__)
 
 # === Настройки камер ===
 CAMERAS = {
     "Камера 1": "http://192.168.5.35:555/d3s1uCw2?container=mjpeg&stream=main",
-    "Камера 2": "http://192.168.5.35:555/JZGVXGWS?container=mjpeg&stream=main"
+    "Камера 2": "http://192.168.5.35:555/JZGVXGWS?container=mjpeg&stream=main",
+    "Камера 3": "http://192.168.5.35:555/PEWIsThO?container=mjpeg&stream=main",
+    "Камера 4": "http://192.168.5.35:555/YBFbIRT0?container=mjpeg&stream=main"
 }
 
 # === Глобальные переменные ===
@@ -26,15 +71,13 @@ latest_frames = {}
 lock_objects = {camera: threading.Lock() for camera in CAMERAS}
 force_reconnect_flags = {camera: False for camera in CAMERAS}
 reconnect_lock = threading.Lock()
-
-user_question = "Describe what you see in this frame?"
 question_lock = threading.Lock()
 
 # === Загрузка моделей ===
 model = YOLO('yolo11n.pt')  # Убедитесь, что модель доступна
 back_sub = cv2.createBackgroundSubtractorMOG2()
 
-# === Класс трекера (без изменений) ===
+# === Класс трекера ===
 class UniqueObjectTracker:
     def __init__(self, max_age=10):
         self.active_objects = {}
@@ -95,7 +138,7 @@ class UniqueObjectTracker:
         yB = min(y1 + h1, y2 + h2)
         interArea = max(0, xB - xA) * max(0, yB - yA)
         box1Area = w1 * h1
-        box2Area = w2 * h2
+        box2Area = w2 * h1
         return interArea / (box1Area + box2Area - interArea)
 
 # === Создание БД и таблицы ===
@@ -111,67 +154,363 @@ def init_db():
                   answer TEXT)''')
     conn.commit()
     conn.close()
-
 init_db()
 
-# === Логирование в БД ===
+# === Логирование в БД и Markdown ===
 def log_analysis(camera_name, obj_id, obj_type, description):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = sqlite3.connect('surveillance.db')
     c = conn.cursor()
+    # Проверяем, нет ли записи с таким же obj_id
+    c.execute("SELECT COUNT(*) FROM logs WHERE obj_id=? AND camera=?", (obj_id, camera_name))
+    exists = c.fetchone()[0] > 0
+    if exists:
+        conn.close()
+        return
+
+    # Добавляем новую запись
     c.execute("INSERT INTO logs (timestamp, camera, obj_type, obj_id, answer) VALUES (?, ?, ?, ?, ?)",
               (timestamp, camera_name, obj_type, obj_id, description))
     conn.commit()
     conn.close()
 
-# === Анализ кадра через LLaVA ===
-def analyze_frame_with_llava(frame, question="Describe what you see in this frame?"):
+    # Запись в Markdown
+    with open(MARKDOWN_FILE, 'a+', encoding='utf-8') as f:
+        f.write(f"\n---\n")
+        f.write(f"**Timestamp**: {timestamp}\n")
+        f.write(f"**Camera**: {camera_name}\n")
+        f.write(f"**Type**: {obj_type}\n")
+        f.write(f"**ID**: {obj_id}\n")
+        f.write(f"**Description**: {description}\n")
+
+    # Отправка каждые 5 минут
+    check_and_send_to_qdrant()
+
+# === Таймер отправки в Qdrant ===
+last_send_time = datetime.now()
+
+def check_and_send_to_qdrant():
+    global last_send_time
+    now = datetime.now()
+    if (now - last_send_time).total_seconds() >= 300:  # 5 минут
+        process_and_send_to_qdrant()
+        last_send_time = now
+
+# === Отправка чанков в Qdrant ===
+def process_and_send_to_qdrant():
+    try:
+        with open(MARKDOWN_FILE, 'r', encoding='utf-8') as f:
+            content = f.read()
+        entries = content.strip().split('\n---\n')
+        chunks = []
+        metadata_list = []
+
+        for entry in entries:
+            if not entry.strip():
+                continue
+            lines = entry.strip().split('\n')
+            meta = {}
+            desc_lines = []
+            events = []
+            anomalies = []
+
+            # Парсим каждую строку
+            for line in lines:
+                if line.startswith("**Timestamp**"):
+                    meta['timestamp'] = line.split(": ", 1)[1]
+                elif line.startswith("**Camera**"):
+                    meta['camera'] = line.split(": ", 1)[1]
+                elif line.startswith("**Type**"):
+                    meta['type'] = line.split(": ", 1)[1]
+                elif line.startswith("**ID**"):
+                    meta['id'] = line.split(": ", 1)[1]
+                elif line.startswith("Описание:"):
+                    desc_lines.append(line.replace("Описание:", "").strip())
+                elif line.startswith("События:"):
+                    pass  # Пропускаем заголовок "События:"
+                elif line.startswith("- "):
+                    events.append(line[2:].strip())
+                elif line.startswith("Аномалии:"):
+                    anomalies.append(line.replace("Аномалии:", "").strip())
+
+            # Формируем описание
+            description = " ".join(desc_lines).strip()
+            # Формируем чанк по вашему формату
+            chunk = f"Камера {meta.get('camera', '?')} Описание: {description}"
+            if events:
+                chunk += "\nСобытия:\n" + "\n".join([f"- {e}" for e in events])
+            if anomalies:
+                chunk += "\nАномалии: " + "; ".join(anomalies)
+
+            chunks.append(chunk)
+            metadata_list.append(meta)
+
+        if len(chunks) == 0:
+            return
+
+        # Разбиваем на батчи по 7 записей
+        chunk_size = 7
+        for i in range(0, len(chunks), chunk_size):
+            batch_chunks = chunks[i:i+chunk_size]
+            batch_metadata = metadata_list[i:i+chunk_size]
+
+            embeddings = bi_encoder.encode(batch_chunks, convert_to_tensor=True).tolist()
+
+            points = [
+                PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=embedding,
+                    payload={
+                        "chunk": chunk,
+                        "timestamp": metadata.get("timestamp", ""),
+                        "camera": metadata.get("camera", ""),
+                        "type": metadata.get("type", ""),
+                        "id": int(metadata.get("id", -1)),
+                    }
+                )
+                for chunk, embedding, metadata in zip(batch_chunks, embeddings, batch_metadata)
+            ]
+
+            qdrant_client.upsert(collection_name=COLL_NAME, wait=True, points=points)
+
+        # Очистка файла
+        with open(MARKDOWN_FILE, 'w', encoding='utf-8') as f:
+            f.write('')
+        logger.info(f"{len(chunks)} записей успешно отправлено в Qdrant")
+
+    except Exception as e:
+        logger.error(f"Ошибка при отправке данных в Qdrant: {e}")
+
+
+# === Анализ кадра через Ollama (русская модель) ===
+def analyze_frame_with_ollama(frame, camera_name=None, obj_id=None):
     try:
         with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmpfile:
             img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             img.save(tmpfile.name, format='JPEG')
             tmpfile_path = tmpfile.name
+        system_prompt = f"""# Ты — видеоаналитическая система безопасности. 
+Твоя задача — обрабатывать входящие кадры с камер видеонаблюдения, анализировать происходящее в кадре и предоставлять структурированное описание ключевых событий.
+### У тебя есть доступ к двум камерам:
+Камера 1: парковка во дворе компании.
+Камера 2: пропускной пункт внутри здания.
+Камера 3 и 4: направлены на коридор внутри офиса компании
+
+### Твои правила:
+1. **Не выдумывай** то, что не видно на кадре.
+2. **Не предполагай мотивы**, намерения или действия, если они не зафиксированы явно.
+3. **Не используй домыслы** о прошлом или будущем событиях.
+4. Описывай **только визуальные элементы**.
+5. Если сложно определить детали — сообщи об этом честно.
+
+### Метаданные кадра:
+- Камера: {camera_name if camera_name else 'неизвестна'}
+- ID объекта: {obj_id if obj_id is not None else 'не задан'}
+- Время анализа: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+### Что нужно сделать:
+1. Уточни, с какой камеры сделан кадр (используй метаданные).
+2. Опиши **только один объект**, который ты видишь на изображении.
+3. Укажи его ID из метаданных.
+4. Перечисли ключевые действия или события, связанные с этим объектом.
+5. Сообщите, если объект не определён, или нет активности.
+6. Укажи возможные аномалии, если они есть.
+7. Ответ должен быть точным, лаконичным и начинаться с указания номера камеры.
+
+### Формат ответа:
+Камера X 
+Описание: [основное описание кадра с написанием ID] 
+События:  
+- [событие 1]  
+- [событие 2]  
+Аномалии: [краткая информация о возможных подозрительных действиях или отклонениях]
+
+### Пример ответа:
+Камера 1  
+Описание: На парковке находится один автомобиль марки Toyota Camry c ID 23. Водитель вышел и направляется к зданию.  
+События:  
+- Водитель Toyota Camry выходит из машины  
+- Водитель направляется к главному входу  
+Аномалии: Никаких подозрительных действий не зафиксировано
+
+Камера 2  
+Описание: В пропускном пункте находится один сотрудник охраны ID 22 и двое сотрудников компании ID 45 и ID 46.  
+События:  
+- Сотрудник предъявляет пропуск  
+- Ожидание проверки второго сотрудника  
+Аномалии: Нет несанкционированных лиц, всё в рамках нормы
+"""
         response = ollama.chat(
-            model="llava",
-            messages=[{
-                "role": "user",
-                "content": question,
-                "images": [tmpfile_path]
-            }]
+            model=OLLAMA_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt.strip()
+                },
+                {
+                    "role": "user",
+                    "content": "Проанализируй кадр и предоставь информацию согласно формату."
+                },
+                {
+                    "role": "user",
+                    "images": [tmpfile_path]
+                }]
         )
         os.unlink(tmpfile_path)
         return response.get("message", {}).get("content", "Нет содержания в ответе")
     except Exception as e:
-        print(f"Ошибка анализа через LLaVA: {e}")
+        logger.error(f"Ошибка анализа через Ollama: {e}")
         return f"Ошибка анализа: {e}"
 
-# === Анализ результатов через Mistral ===
-def analyze_results_with_mistral(logs, user_query):
-    """Отправляет результаты поиска в Mistral для анализа"""
+def rerank_chunks(query, chunks):
+    """
+    Реранкинг чанков с использованием CrossEncoder.
+    """
+    # Формируем пары [query, chunk]
+    pairs = [[query, chunk] for chunk in chunks]
+    # Получаем оценки релевантности
+    scores = reranker.predict(pairs)
+    # Сортируем чанки по убыванию релевантности
+    ranked_chunks = [chunk for _, chunk in sorted(zip(scores, chunks), reverse=True)]
+    return ranked_chunks
+
+
+def vec_search(query, n_top=50):
+    query_emb = bi_encoder.encode([query]).tolist()[0]
+    results = qdrant_client.search(
+        collection_name=COLL_NAME,
+        query_vector=query_emb,
+        limit=n_top
+    )
+    chunks = [hit.payload['chunk'] for hit in results]
+    ranked_chunks = rerank_chunks(query, chunks)
+    return ranked_chunks
+
+
+# === Поиск в Qdrant и ответ от Mistral ===
+@app.route('/ask_model', methods=['POST'])
+def ask_model():
+    data = request.get_json()
+    query = data.get("question", "")
+    current_time = data.get("time", "")
+    
+
+    if not query:
+        return jsonify({"error": "No question provided"}), 400
+
     try:
-        # Формируем контекст для модели
-        context = f"На основе следующих данных из базы наблюдения:\n\n"
-        for entry in logs:
-            context += f"[{entry['timestamp']}] {entry['camera']} — {entry['type']} (ID: {entry['obj_id']}): {entry['answer']}\n"
-        context += f"\nЗапрос пользователя: {user_query}\n\n"
-        context += "Пожалуйста, проанализируйте данные и ответьте на запрос пользователя."
-
-        response = ollama.chat(
-            model="mistral:7b",
-            messages=[{"role": "user", "content": context}]
-        )
+        # Формируем временной диапазон
         
-        return response.get("message", {}).get("content", "Модель не смогла проанализировать данные.")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if not current_time else current_time
+
+        results = qdrant_client.search(
+            collection_name=COLL_NAME,
+            query_vector=bi_encoder.encode([query]).tolist()[0],
+            limit=50
+        )
+
+        # Извлечение чанков и метаданных
+        chunks = [hit.payload['chunk'] for hit in results]
+
+        # Реранкинг чанков
+        ranked_chunks = rerank_chunks(query, chunks)
+
+        # Формирование контекста
+        context = "\n".join(ranked_chunks[:7])
+
+        full_prompt = f"""
+Ты — виртуальный ассистент охранника , установленный на контрольно-наблюдательном посту. Твоя задача — помогать охраннику следить за безопасностью на территории, анализировать видеопоток с камер, фиксировать подозрительные события, отвечать на вопросы по обстановке и предоставлять краткие логические выводы.
+Ты подключен к системе видеонаблюдения и можешь описывать происходящее на любой из камер, анализировать изменения в обстановке, выделять важные события и своевременно информировать персонал
+
+
+Основные функции:
+Отслеживание изменений в зоне наблюдения.
+Краткое описание событий и действий людей/объектов.
+Фиксация необычной активности (например: подозрительное лицо, шум ночью, движение в запретной зоне).
+Обработка запросов типа:
+1. «Что происходит на камере 3?»
+2. «Какие события были за последние 10 минут?»
+3. «Есть ли движения у склада?»
+4. «Покажи последнюю запись с главного входа»
+Предоставление структурированной информации без лишних деталей.
+Своевременное предупреждение о возможных рисках.
+
+
+Стиль общения:
+Четкий, официально-нейтральный.
+Без эмоций, только факты.
+Ответы должны быть структурированными и понятными.
+При необходимости использовать маркированные списки или тайм-метки.
+
+
+Примеры вопросов и ответов:
+Вопрос:
+Какие события произошли за последние 10 минут?
+
+Ответ:
+Сейчас 2025-07-09 12:16:11. За последние 10 минут зафиксированы следующие события:
+
+08:42 — Подъезд автомобиля к зданию. Водитель вышел, поговорил с сотрудником, уехал.
+08:49 — Прохожий вошёл в зону камеры 7, сделал несколько фотографий и покинул территорию.
+08:55 — На камере 4 замечено движение в прилегающем кустарнике. Возможно животное.
+Вопрос:
+Что ты видишь на камере 2?
+
+Ответ:
+Сейчас 2025-02-19 02:55:05. На камере 2 (вход со стороны парковки) наблюдается:
+
+Два сотрудника входят в здание через центральный вход.
+Один автомобиль медленно проезжает мимо, номер распознан: А123ВР.
+Никаких подозрительных действий не зафиксировано.
+
+Вопрос:
+Были ли попытки несанкционированного доступа?
+
+Ответ:
+Сейчас 2023-05-23 14:36:40. Да. В 08:36 была попытка открыть дверь склада без авторизации. Лицо не распознано. Система отправила сигнал тревоги на пульт охраны.
+
+Вопрос:
+Что происходит у заднего выхода?
+
+Ответ:
+На камере 5 (задний выход) — никого нет. Дверь закрыта. Последнее перемещение было зафиксировано в 08:15 — сотрудник вышел на короткое время и вернулся.
+
+Ограничения:
+Не выдумывай информацию, если данные отсутствуют.
+Если событие неизвестно, сообщи об этом честно.
+Не делай предположений без явных признаков.
+Не используй сложную терминологию, говори понятно и лаконично.
+
+Контекст:
+==========
+{context}
+==========
+
+Текущее время:
+{now}
+
+Вопрос:
+==========
+{query}
+==========
+"""
+
+        response = client.chat.completions.create(model=MISTRAL_MODEL, messages=[
+            {"role": "system", "content": "Вы — полезный ассистент, говорящий на русском языке."},
+            {"role": "user", "content": full_prompt}],
+            temperature=0.7
+            )
+
+        return jsonify({"answer": response.choices[0].message.content})
     except Exception as e:
-        print(f"Ошибка анализа через Mistral: {e}")
-        return f"Ошибка анализа: {e}"
+        logger.error(f"Ошибка при генерации ответа: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
 # === Поток для обработки одной камеры ===
 def camera_processing_thread(camera_name, camera_url):
-    local_model = YOLO('yolo11n.pt')  # Загрузка модели внутри потока
+    local_model = YOLO('yolo11n.pt')
     tracker = UniqueObjectTracker(max_age=10)
     cap = None
-    
     while True:
         with reconnect_lock:
             if force_reconnect_flags[camera_name] or (cap is None or not cap.isOpened()):
@@ -180,7 +519,7 @@ def camera_processing_thread(camera_name, camera_url):
                 print(f"[{camera_name}] Подключились к: {camera_url}")
                 cap = cv2.VideoCapture(camera_url)
                 force_reconnect_flags[camera_name] = False
-        
+
         ret, frame = cap.read()
         if not ret:
             print(f"[{camera_name}] Ошибка чтения кадра. Переподключение...")
@@ -189,7 +528,7 @@ def camera_processing_thread(camera_name, camera_url):
             time.sleep(5)
             continue
 
-        results = local_model.track(frame, persist=True, verbose=False, tracker="bytetrack.yaml")
+        results = local_model.track(frame, persist=True, verbose=False, tracker="bytetrack.yaml", conf=0.6)
         detections = []
         if results and hasattr(results[0], 'boxes'):
             for obj in results[0].boxes:
@@ -197,30 +536,26 @@ def camera_processing_thread(camera_name, camera_url):
                 bbox = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
                 label = local_model.names[int(obj.cls)]
                 detections.append((bbox, label))
-        
+
         tracked_objects = tracker.update(detections)
-        
+
         # === Анализ новых объектов ===
         for obj_id, obj_data in tracked_objects.items():
             if not obj_data.get('analyzed', False):
                 x, y, w, h = obj_data['bbox']
                 obj_frame = frame[y:y+h, x:x+w]
                 with question_lock:
-                    description = analyze_frame_with_llava(obj_frame, user_question)
+                    description = analyze_frame_with_ollama(obj_frame, camera_name, obj_id)
                 log_analysis(camera_name, obj_id, obj_data['label'], description)
                 obj_data['analyzed'] = True
                 tracker.active_objects[obj_id] = obj_data
-        
-        if results and hasattr(results[0], 'boxes'):
-            annotated_frame = results[0].plot()
-        else:
-            annotated_frame = frame.copy()
-        
+
+        annotated_frame = results[0].plot() if results else frame.copy()
         with lock_objects[camera_name]:
             latest_frames[camera_name] = annotated_frame
-        
         time.sleep(0.03)
 
+# === Flask маршруты ===
 @app.route('/')
 def index():
     return render_template('index.html', cameras=CAMERAS.keys())
@@ -230,20 +565,16 @@ def video_feed():
     camera_name = request.args.get('camera', '')
     if camera_name not in CAMERAS:
         return "Camera not found", 404
-    
+
     def generate(camera):
         while True:
             frame = latest_frames.get(camera, None)
             if frame is not None:
                 ret, buffer = cv2.imencode('.jpg', frame)
                 if ret:
-                    frame_data = buffer.tobytes()
                     yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n'
-                           b'Content-Length: ' + f"{len(frame_data)}".encode() + b'\r\n'
-                           b'\r\n' + frame_data + b'\r\n')
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
             time.sleep(0.03)
-    
     return Response(generate(camera_name), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/set_camera', methods=['POST'])
@@ -262,7 +593,6 @@ def search_logs():
     obj_type = request.args.get('type', '')
     keyword = request.args.get('keyword', '').lower()
     camera = request.args.get('camera', '')
-    user_query = request.args.get('user_query', '').strip()
 
     query = "SELECT * FROM logs WHERE 1=1"
     params = []
@@ -279,18 +609,22 @@ def search_logs():
     if start_time:
         query += " AND timestamp >= ?"
         params.append(start_time)
+
     if end_time:
         query += " AND timestamp <= ?"
         params.append(end_time)
-    if camera:
-        query += " AND camera = ?"
-        params.append(camera)
+
     if obj_type:
         query += " AND obj_type = ?"
         params.append(obj_type)
+
     if keyword:
         query += " AND answer LIKE ?"
         params.append(f"%{keyword}%")
+
+    if camera:
+        query += " AND camera = ?"
+        params.append(camera)
 
     conn = sqlite3.connect('surveillance.db')
     c = conn.cursor()
@@ -300,39 +634,30 @@ def search_logs():
 
     logs = [{"timestamp": r[1], "camera": r[2], "type": r[3], "obj_id": r[4], "answer": r[5]} for r in rows]
     logs.sort(key=lambda x: x['timestamp'], reverse=True)
+    return jsonify(logs)
 
-    # Если есть пользовательский запрос, отправляем в Mistral
-    if user_query and logs:
-        analysis = analyze_results_with_mistral(logs, user_query)
-        return jsonify({"analysis": analysis, "results": logs})
-    elif user_query and not logs:
-        return jsonify({"analysis": "Нет данных для анализа", "results": []})
-    else:
-        return jsonify({"results": logs})
+# === Создание коллекции в Qdrant ===
+try:
+    collections = qdrant_client.get_collections().collections
+    collection_names = [col.name for col in collections]
+    if COLL_NAME not in collection_names:
+        qdrant_client.create_collection(
+            collection_name=COLL_NAME,
+            vectors_config=VectorParams(size=bi_encoder_dim, distance=Distance.COSINE)
+        )
+        logger.info(f"Коллекция '{COLL_NAME}' создана в Qdrant")
+except Exception as e:
+    logger.error(f"Ошибка проверки коллекции Qdrant: {e}")
 
-# === MJPEG поток ===
-def generate_frames():
-    global latest_frame
-    while True:
-        if latest_frame is not None:
-            ret, buffer = cv2.imencode('.jpg', latest_frame)
-            if ret:
-                frame = buffer.tobytes()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n'
-                       b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
-                       b'\r\n' + frame + b'\r\n')
-        time.sleep(0.03)
+# === Запуск потоков камер ===
+for camera_name, camera_url in CAMERAS.items():
+    thread = threading.Thread(
+        target=camera_processing_thread,
+        args=(camera_name, camera_url),
+        daemon=True
+    )
+    thread.start()
+    camera_threads[camera_name] = thread
 
 if __name__ == '__main__':
-    # Запускаем обработку для каждой камеры в отдельном потоке
-    for camera_name, camera_url in CAMERAS.items():
-        thread = threading.Thread(
-            target=camera_processing_thread,
-            args=(camera_name, camera_url),
-            daemon=True
-        )
-        thread.start()
-        camera_threads[camera_name] = thread
-    
-    app.run(host='0.0.0.0', port=8010, debug=True)
+    app.run(host='0.0.0.0', port=8090, debug=True)
