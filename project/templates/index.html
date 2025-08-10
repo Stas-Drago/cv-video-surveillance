@@ -13,11 +13,7 @@
     .container {
       max-width: 1200px;
       margin: 0 auto;
-      background: #ffffff;
-      border-radius: 12px;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-      padding: 30px;
-      text-align: center;
+      padding: 20px;
     }
     h1 {
       text-align: center;
@@ -25,6 +21,7 @@
       font-size: 24px;
       color: #2c3e50;
     }
+
     /* Сетка для камер */
     .grid-container {
       display: grid;
@@ -53,7 +50,8 @@
       box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
       transition: all 0.3s ease;
     }
-    /* Стили для увеличенного режима */
+
+    /* Увеличенный режим */
     .camera-box.expanded {
       position: fixed;
       top: 0;
@@ -67,11 +65,6 @@
       align-items: center;
       justify-content: center;
       padding: 0;
-    }
-    .camera-box.expanded .camera-video {
-      max-width: 90vw;
-      max-height: 80vh;
-      box-shadow: 0 0 20px rgba(0, 0, 0, 0.7);
     }
     .close-btn {
       position: absolute;
@@ -93,7 +86,8 @@
     .expanded .close-btn {
       display: block;
     }
-    /* Форма фильтрации и результаты */
+
+    /* Форма фильтрации и логи */
     .section {
       margin: 30px 0;
       background: #ffffff;
@@ -101,28 +95,11 @@
       border-radius: 12px;
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
     }
-    .filter-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      justify-content: space-between;
-      align-items: flex-end;
-    }
-    .filter-group {
-      flex: 1 1 200px;
-      min-width: 150px;
-    }
-    .filter-group label {
-      display: block;
-      font-size: 14px;
-      margin-bottom: 5px;
-    }
-    .filter-group input,
-    .filter-group select {
-      width: 100%;
-      box-sizing: border-box;
-    }
-    select, input[type="number"], input[type="text"], input[type="datetime-local"], button {
+    select,
+    input[type="number"],
+    input[type="text"],
+    input[type="datetime-local"],
+    button {
       padding: 10px 15px;
       margin: 10px 0;
       width: 100%;
@@ -131,7 +108,8 @@
       font-size: 16px;
       transition: border-color 0.3s;
     }
-    select:focus, input:focus {
+    select:focus,
+    input:focus {
       border-color: #3498db;
       outline: none;
     }
@@ -151,7 +129,8 @@
       border-collapse: collapse;
       margin-top: 20px;
     }
-    #logTable th, #logTable td {
+    #logTable th,
+    #logTable td {
       border: 1px solid #ddd;
       padding: 8px;
       text-align: left;
@@ -162,172 +141,180 @@
     #logTable tr:hover {
       background-color: #f9f9f9;
     }
-    .analysis-result {
-      margin-top: 20px;
-      padding: 15px;
-      background: #e8f4ff;
-      border-left: 4px solid #3498db;
-      font-style: italic;
-      white-space: pre-wrap;
-      text-align: left;
+
+    /* Чат с моделью */
+    .chat-section {
+      margin-top: 30px;
+    }
+    #chatLog {
+      height: 200px;
+      overflow-y: auto;
+      border: 1px solid #ccc;
+      padding: 10px;
+      background: #fff;
+      border-radius: 8px;
+      margin-bottom: 10px;
+    }
+    .message {
+      margin: 5px 0;
+    }
+    .user {
+      color: blue;
+    }
+    .bot {
+      color: green;
     }
   </style>
 </head>
 <body>
-<div class="container">
-  <h1>Видеонаблюдение с ИИ</h1>
-  
-  <!-- Видеопотоки -->
-  <div class="grid-container">
-    {% for camera in cameras %}
-      <div class="camera-box" onclick="toggleFullScreen(this)">
-        <button class="close-btn" onclick="toggleFullScreen(this.parentNode)">&times;</button>
-        <div class="camera-title">{{ camera }}</div>
-        <img class="camera-video" src="/video_feed?camera={{ camera }}" alt="{{ camera }} видеопоток" />
-      </div>
-    {% endfor %}
-  </div>
-  
-  <!-- Форма фильтрации -->
-  <div class="section">
-    <h2>Фильтр по логам</h2>
-    <form id="filterForm">
-      <div class="filter-row">
-        <div class="filter-group">
-          <label>За последние (минут):</label>
-          <input type="number" id="minutesFilter" placeholder="Например: 60" />
-        </div>
-        <div class="filter-group">
-          <label>Начало временного промежутка:</label>
-          <input type="datetime-local" id="startTimeFilter" />
-        </div>
-        <div class="filter-group">
-          <label>Конец временного промежутка:</label>
-          <input type="datetime-local" id="endTimeFilter" />
-        </div>
-        <div class="filter-group">
-          <label>Камера:</label>
-          <select id="cameraFilter">
-            <option value="">Все</option>
-            {% for name in cameras %}
-              <option value="{{ name }}">{{ name }}</option>
-            {% endfor %}
-          </select>
-        </div>
-      </div>
-      
-      <div class="filter-row">
-        <div class="filter-group">
-          <label>Тип объекта:</label>
-          <select id="typeFilter">
-            <option value="">Все</option>
-            <option value="person">Человек</option>
-            <option value="car">Автомобиль</option>
-            <option value="truck">Грузовой автомобиль</option>
-            <option value="bus">Автобус</option>
-            <option value="motorcycle">Мотоцикл</option>
-          </select>
-        </div>
-        <div class="filter-group">
-          <label>Ключевое слово в описании:</label>
-          <input type="text" id="keywordFilter" placeholder="Например: коробка" />
-        </div>
-        <div class="filter-group">
-          <label>Ваш запрос:</label>
-          <input type="text" id="userQuery" placeholder="Например: Какие объекты были на камере за последние 5 минут?" />
-        </div>
-        <div class="filter-group">
-          <button type="submit" style="width: 100%; padding: 12px 15px;">Поиск</button>
-        </div>
-      </div>
-    </form>
-  </div>
-  
-  <!-- Результаты анализа и логи -->
-  <div class="section">
-    <h2>Анализ данных</h2>
-    <div class="analysis-result" id="analysisResult">Модель ещё не проанализировала данные.</div>
-    <h2>Лог событий</h2>
-    <table id="logTable">
-      <thead>
-        <tr>
-          <th>Время</th>
-          <th>Камера</th>
-          <th>Тип объекта</th>
-          <th>ID</th>
-          <th>Ответ модели</th>
-        </tr>
-      </thead>
-      <tbody id="logBody">
-        <tr><td colspan="5">Нет событий</td></tr>
-      </tbody>
-    </table>
-  </div>
-</div>
+  <div class="container">
+    <h1>Видеонаблюдение с ИИ</h1>
 
-<script>
-  // === Обработка формы фильтрации ===
-  document.getElementById('filterForm').addEventListener('submit', function (e) {
-    e.preventDefault();
+    <!-- Видеопотоки -->
+    <div class="grid-container">
+      {% for camera in cameras %}
+        <div class="camera-box" onclick="toggleFullScreen(this)">
+          <div class="camera-title">{{ camera }}</div>
+          <img class="camera-video" src="/video_feed?camera={{ camera }}" alt="{{ camera }} видеопоток" />
+        </div>
+      {% endfor %}
+    </div>
     
-    const minutes = document.getElementById('minutesFilter').value;
-    const startTime = document.getElementById('startTimeFilter').value;
-    const endTime = document.getElementById('endTimeFilter').value;
-    const camera = document.getElementById('cameraFilter').value;
-    const type = document.getElementById('typeFilter').value;
-    const keyword = document.getElementById('keywordFilter').value;
-    const userQuery = document.getElementById('userQuery').value;
+    <!-- Диалог с нейросетью -->
+    <div class="section chat-section">
+      <h2>Задайте вопрос модели</h2>
+      <div id="chatLog"></div>
+      <input type="text" id="questionInput" placeholder="Введите ваш вопрос..." style="width: 100%; padding: 10px;" />
+      <button onclick="askModel()">Отправить</button>
+    </div>
     
-    let url = '/search_logs?';
-    if (minutes) url += `time=${encodeURIComponent(minutes)}&`;
-    if (startTime) url += `start_time=${encodeURIComponent(startTime)}&`;
-    if (endTime) url += `end_time=${encodeURIComponent(end_time)}&`;
-    if (camera) url += `camera=${encodeURIComponent(camera)}&`;
-    if (type) url += `type=${encodeURIComponent(type)}&`;
-    if (keyword) url += `keyword=${encodeURIComponent(keyword)}&`;
-    if (userQuery) url += `user_query=${encodeURIComponent(userQuery)}&`;
-    
-    fetch(url)
-      .then(res => res.json())
-      .then(data => {
-        const logBody = document.getElementById('logBody');
-        const analysisResult = document.getElementById('analysisResult');
-        logBody.innerHTML = "";
-        analysisResult.textContent = "";
-        
-        if (!data.results || data.results.length === 0) {
-          logBody.innerHTML = "<tr><td colspan='5'>Нет совпадений</td></tr>";
-          return;
-        }
-        
-        // Выводим результат анализа
-        if (data.analysis) {
-          analysisResult.textContent = data.analysis;
-        }
-        
-        // Выводим таблицу с результатами
-        data.results.forEach(entry => {
-          const row = document.createElement("tr");
-          row.innerHTML = `
-            <td>${entry.timestamp}</td>
-            <td>${entry.camera}</td>
-            <td>${entry.type}</td>
-            <td>${entry.obj_id}</td>
-            <td>${entry.answer}</td>
-          `;
-          logBody.appendChild(row);
+    <!-- Форма фильтрации -->
+    <div class="section">
+      <h2>Фильтр по логам</h2>
+      <form id="filterForm">
+        <label>За последние (минут):</label>
+        <input type="number" id="minutesFilter" placeholder="Например: 60" />
+        <label>Начало временного промежутка:</label>
+        <input type="datetime-local" id="startTimeFilter" />
+        <label>Конец временного промежутка:</label>
+        <input type="datetime-local" id="endTimeFilter" />
+        <label>Камера:</label>
+        <select id="cameraFilter">
+          <option value="">Все</option>
+          {% for name in cameras %}
+            <option value="{{ name }}">{{ name }}</option>
+          {% endfor %}
+        </select>
+        <label>Тип объекта:</label>
+        <select id="typeFilter">
+          <option value="">Все</option>
+          <option value="person">Человек</option>
+          <option value="car">Автомобиль</option>
+          <option value="truck">Грузовой автомобиль</option>
+          <option value="bus">Автобус</option>
+          <option value="motorcycle">Мотоцикл</option>
+        </select>
+        <label>Ключевое слово в описании:</label>
+        <input type="text" id="keywordFilter" placeholder="Например: коробка" />
+        <button type="submit">Поиск</button>
+      </form>
+    </div>
+
+    <!-- Лог событий -->
+    <div class="section">
+      <h2>Лог событий</h2>
+      <table id="logTable">
+        <thead>
+          <tr>
+            <th>Время</th>
+            <th>Камера</th>
+            <th>Тип объекта</th>
+            <th>ID</th>
+            <th>Ответ модели</th>
+          </tr>
+        </thead>
+        <tbody id="logBody">
+          <tr><td colspan="5">Нет событий</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    // === Форма фильтрации ===
+    document.getElementById('filterForm').addEventListener('submit', function (e) {
+      e.preventDefault();
+      const minutes = document.getElementById('minutesFilter').value;
+      const startTime = document.getElementById('startTimeFilter').value;
+      const endTime = document.getElementById('endTimeFilter').value;
+      const camera = document.getElementById('cameraFilter').value;
+      const type = document.getElementById('typeFilter').value;
+      const keyword = document.getElementById('keywordFilter').value;
+      let url = '/search_logs?';
+      if (minutes) url += `time=${encodeURIComponent(minutes)}&`;
+      if (startTime) url += `start_time=${encodeURIComponent(startTime)}&`;
+      if (endTime) url += `end_time=${encodeURIComponent(end_time)}&`;
+      if (camera) url += `camera=${encodeURIComponent(camera)}&`;
+      if (type) url += `type=${encodeURIComponent(type)}&`;
+      if (keyword) url += `keyword=${encodeURIComponent(keyword)}&`;
+      fetch(url)
+        .then(res => res.json())
+        .then(data => {
+          const logBody = document.getElementById('logBody');
+          logBody.innerHTML = '';
+          if (data.length === 0) {
+            logBody.innerHTML = "<tr><td colspan='5'>Нет совпадений</td></tr>";
+            return;
+          }
+          data.forEach(entry => {
+            const row = document.createElement("tr");
+            row.innerHTML = `
+              <td>${entry.timestamp}</td>
+              <td>${entry.camera}</td>
+              <td>${entry.type}</td>
+              <td>${entry.obj_id}</td>
+              <td>${entry.answer}</td>
+            `;
+            logBody.appendChild(row);
+          });
+        })
+        .catch(err => {
+          console.error("Ошибка поиска:", err);
         });
-      })
-      .catch(err => {
-        console.error("Ошибка поиска:", err);
-        document.getElementById('analysisResult').textContent = "Ошибка выполнения поиска";
-      });
-  });
+    });
 
-  // === Функция увеличения камеры ===
-  function toggleFullScreen(cameraBox) {
-    cameraBox.classList.toggle('expanded');
-  }
-</script>
+    // === Увеличение камеры ===
+    function toggleFullScreen(cameraBox) {
+      cameraBox.classList.toggle('expanded');
+    }
+
+    // === Диалог с моделью ===
+    async function askModel() {
+      const input = document.getElementById('questionInput');
+      const question = input.value.trim();
+      if (!question) return;
+
+      appendMessage('Вы', question, 'user');
+
+      const response = await fetch('/ask_model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question })
+      });
+
+      const result = await response.json();
+      appendMessage('Модель', result.answer, 'bot');
+      input.value = '';
+    }
+
+    function appendMessage(author, message, className) {
+      const chatLog = document.getElementById('chatLog');
+      const div = document.createElement('div');
+      div.className = 'message ' + className;
+      div.innerHTML = `<strong>${author}:</strong> ${message}`;
+      chatLog.appendChild(div);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+  </script>
 </body>
 </html>

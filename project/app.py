@@ -7,31 +7,22 @@ from datetime import datetime, timedelta
 import ollama
 import tempfile
 from PIL import Image
-import uuid
 import time
 import sqlite3
+import uuid
 import logging
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, PointStruct
-from openai import OpenAI
-
-
-client = OpenAI(
-  api_key='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjkxMWFmMmEzLWM5YTItNDdmZS05YzQ5LWFjMGQ3ZjAwOTAxYyIsImlzRGV2ZWxvcGVyIjp0cnVlLCJpYXQiOjE3NTE3OTMzMTgsImV4cCI6MjA2NzM2OTMxOH0.4TW93nJ-L5ali4CDg92xsKNfuVgFLlW4DhGSPpoPXu8',
-  base_url='https://bothub.chat/api/v2/openai/v1'
-)
 
 # --- Настройки ---
 QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
-COLL_NAME = "markdown_collection"
+COLL_NAME = "surveillance_collection"
 MARKDOWN_FILE = "logs.md"
 OLLAMA_MODEL = "gemma3:12b-it-qat"
-MISTRAL_MODEL = "mistral-large"
+MISTRAL_MODEL = "mistral:7b"
 BI_ENCODER_MODEL = "sentence-transformers/LaBSE"
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-2-v2")
-
 
 # --- Логирование ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -43,7 +34,7 @@ try:
     logger.info("Подключились к Qdrant")
 except Exception as e:
     logger.error(f"Не удалось подключиться к Qdrant: {e}")
-
+    exit(1)
 
 # --- Инициализация bi-encoder ---
 try:
@@ -52,9 +43,9 @@ try:
     logger.info(f"Инициализирован bi-encoder LaBSE, размерность: {bi_encoder_dim}")
 except Exception as e:
     logger.error(f"Ошибка при инициализации bi-encoder: {e}")
+    exit(1)
 
-
-# --- Flask ---
+# --- Инициализация Flask ---
 app = Flask(__name__)
 
 # === Настройки камер ===
@@ -71,75 +62,15 @@ latest_frames = {}
 lock_objects = {camera: threading.Lock() for camera in CAMERAS}
 force_reconnect_flags = {camera: False for camera in CAMERAS}
 reconnect_lock = threading.Lock()
+user_question = "Опиши, что ты видишь на этом кадре? Напиши кратко, описывай только ключевые моменты."
 question_lock = threading.Lock()
 
+# === Глобальный трекер (для отслеживания объектов между камерами)
+global_tracker = {}
+
 # === Загрузка моделей ===
-model = YOLO('yolo11n.pt')  # Убедитесь, что модель доступна
+model = YOLO('yolo11n.pt')
 back_sub = cv2.createBackgroundSubtractorMOG2()
-
-# === Класс трекера ===
-class UniqueObjectTracker:
-    def __init__(self, max_age=10):
-        self.active_objects = {}
-        self.max_age = max_age
-        self.next_id = 0
-
-    def register(self, bbox):
-        self.active_objects[self.next_id] = {
-            'bbox': bbox,
-            'first_seen': datetime.now(),
-            'last_seen': datetime.now(),
-            'analyzed': False,
-            'type': None
-        }
-        obj_id = self.next_id
-        self.next_id += 1
-        return obj_id
-
-    def update(self, detections):
-        updated = {}
-        for det_bbox, label in detections:
-            matched = False
-            for obj_id, obj_data in self.active_objects.items():
-                if self.iou(det_bbox, obj_data['bbox']) > 0.3:
-                    updated[obj_id] = {
-                        'bbox': det_bbox,
-                        'first_seen': obj_data['first_seen'],
-                        'last_seen': datetime.now(),
-                        'label': label,
-                        'analyzed': obj_data['analyzed'],
-                        'type': obj_data['type']
-                    }
-                    matched = True
-                    break
-            if not matched:
-                new_id = self.register(det_bbox)
-                updated[new_id] = {
-                    'bbox': det_bbox,
-                    'first_seen': datetime.now(),
-                    'last_seen': datetime.now(),
-                    'label': label,
-                    'analyzed': False,
-                    'type': label
-                }
-        now = datetime.now()
-        for obj_id in list(self.active_objects.keys()):
-            if obj_id not in updated and (now - self.active_objects[obj_id]['last_seen']).total_seconds() < self.max_age:
-                updated[obj_id] = self.active_objects[obj_id]
-        self.active_objects = updated
-        return self.active_objects
-
-    def iou(self, box1, box2):
-        x1, y1, w1, h1 = box1
-        x2, y2, w2, h2 = box2
-        xA = max(x1, x2)
-        yA = max(y1, y2)
-        xB = min(x1 + w1, x2 + w2)
-        yB = min(y1 + h1, y2 + h2)
-        interArea = max(0, xB - xA) * max(0, yB - yA)
-        box1Area = w1 * h1
-        box2Area = w2 * h1
-        return interArea / (box1Area + box2Area - interArea)
 
 # === Создание БД и таблицы ===
 def init_db():
@@ -151,17 +82,19 @@ def init_db():
                   camera TEXT,
                   obj_type TEXT,
                   obj_id INTEGER,
-                  answer TEXT)''')
+                  description TEXT)''')
     conn.commit()
     conn.close()
 init_db()
 
 # === Логирование в БД и Markdown ===
 def log_analysis(camera_name, obj_id, obj_type, description):
+    global global_tracker
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = sqlite3.connect('surveillance.db')
     c = conn.cursor()
-    # Проверяем, нет ли записи с таким же obj_id
+    # Проверяем, не дублируется ли obj_id на той же камере
     c.execute("SELECT COUNT(*) FROM logs WHERE obj_id=? AND camera=?", (obj_id, camera_name))
     exists = c.fetchone()[0] > 0
     if exists:
@@ -174,14 +107,26 @@ def log_analysis(camera_name, obj_id, obj_type, description):
     conn.commit()
     conn.close()
 
+    # Обновляем global_tracker
+    if obj_id not in global_tracker:
+        global_tracker[obj_id] = {
+            "first_seen": timestamp,
+            "cameras": []
+        }
+    global_tracker[obj_id]["cameras"].append({
+        "camera": camera_name,
+        "timestamp": timestamp,
+        "description": description
+    })
+
     # Запись в Markdown
     with open(MARKDOWN_FILE, 'a+', encoding='utf-8') as f:
         f.write(f"\n---\n")
-        f.write(f"**Timestamp**: {timestamp}\n")
-        f.write(f"**Camera**: {camera_name}\n")
-        f.write(f"**Type**: {obj_type}\n")
-        f.write(f"**ID**: {obj_id}\n")
-        f.write(f"**Description**: {description}\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Camera: {camera_name}\n")
+        f.write(f"Type: {obj_type}\n")
+        f.write(f"ID: {obj_id}\n")
+        f.write(f"Description: {description}\n")
 
     # Отправка каждые 5 минут
     check_and_send_to_qdrant()
@@ -210,45 +155,26 @@ def process_and_send_to_qdrant():
                 continue
             lines = entry.strip().split('\n')
             meta = {}
-            desc_lines = []
-            events = []
-            anomalies = []
-
-            # Парсим каждую строку
+            desc = ""
             for line in lines:
-                if line.startswith("**Timestamp**"):
-                    meta['timestamp'] = line.split(": ", 1)[1]
-                elif line.startswith("**Camera**"):
-                    meta['camera'] = line.split(": ", 1)[1]
-                elif line.startswith("**Type**"):
-                    meta['type'] = line.split(": ", 1)[1]
-                elif line.startswith("**ID**"):
-                    meta['id'] = line.split(": ", 1)[1]
-                elif line.startswith("Описание:"):
-                    desc_lines.append(line.replace("Описание:", "").strip())
-                elif line.startswith("События:"):
-                    pass  # Пропускаем заголовок "События:"
-                elif line.startswith("- "):
-                    events.append(line[2:].strip())
-                elif line.startswith("Аномалии:"):
-                    anomalies.append(line.replace("Аномалии:", "").strip())
-
-            # Формируем описание
-            description = " ".join(desc_lines).strip()
-            # Формируем чанк по вашему формату
-            chunk = f"Камера {meta.get('camera', '?')} Описание: {description}"
-            if events:
-                chunk += "\nСобытия:\n" + "\n".join([f"- {e}" for e in events])
-            if anomalies:
-                chunk += "\nАномалии: " + "; ".join(anomalies)
-
-            chunks.append(chunk)
-            metadata_list.append(meta)
+                if line.startswith("Timestamp:"):
+                    meta['timestamp'] = line.split(":", 1)[1].strip()
+                elif line.startswith("Camera:"):
+                    meta['camera'] = line.split(":", 1)[1].strip()
+                elif line.startswith("Type:"):
+                    meta['type'] = line.split(":", 1)[1].strip()
+                elif line.startswith("ID:"):
+                    meta['id'] = int(line.split(":", 1)[1].strip())
+                elif line.startswith("Description:"):
+                    desc = line.split(":", 1)[1].strip()
+            if desc:
+                chunks.append(desc)
+                metadata_list.append(meta)
 
         if len(chunks) == 0:
             return
 
-        # Разбиваем на батчи по 7 записей
+        # Разбиваем на чанки по 7 записей
         chunk_size = 7
         for i in range(0, len(chunks), chunk_size):
             batch_chunks = chunks[i:i+chunk_size]
@@ -262,10 +188,7 @@ def process_and_send_to_qdrant():
                     vector=embedding,
                     payload={
                         "chunk": chunk,
-                        "timestamp": metadata.get("timestamp", ""),
-                        "camera": metadata.get("camera", ""),
-                        "type": metadata.get("type", ""),
-                        "id": int(metadata.get("id", -1)),
+                        "metadata": metadata
                     }
                 )
                 for chunk, embedding, metadata in zip(batch_chunks, embeddings, batch_metadata)
@@ -273,7 +196,7 @@ def process_and_send_to_qdrant():
 
             qdrant_client.upsert(collection_name=COLL_NAME, wait=True, points=points)
 
-        # Очистка файла
+        # Очищаем файл
         with open(MARKDOWN_FILE, 'w', encoding='utf-8') as f:
             f.write('')
         logger.info(f"{len(chunks)} записей успешно отправлено в Qdrant")
@@ -281,14 +204,14 @@ def process_and_send_to_qdrant():
     except Exception as e:
         logger.error(f"Ошибка при отправке данных в Qdrant: {e}")
 
-
-# === Анализ кадра через Ollama (русская модель) ===
-def analyze_frame_with_ollama(frame, camera_name=None, obj_id=None):
+# === Анализ кадра через Ollama ===
+def analyze_frame_with_ollama(frame, camera_name=None, obj_id=None, obj_type=None):
     try:
         with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmpfile:
             img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             img.save(tmpfile.name, format='JPEG')
             tmpfile_path = tmpfile.name
+
         system_prompt = f"""# Ты — видеоаналитическая система безопасности. 
 Твоя задача — обрабатывать входящие кадры с камер видеонаблюдения, анализировать происходящее в кадре и предоставлять структурированное описание ключевых событий.
 ### У тебя есть доступ к двум камерам:
@@ -340,85 +263,42 @@ def analyze_frame_with_ollama(frame, camera_name=None, obj_id=None):
 - Ожидание проверки второго сотрудника  
 Аномалии: Нет несанкционированных лиц, всё в рамках нормы
 """
+
         response = ollama.chat(
             model=OLLAMA_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt.strip()
-                },
-                {
-                    "role": "user",
-                    "content": "Проанализируй кадр и предоставь информацию согласно формату."
-                },
-                {
-                    "role": "user",
-                    "images": [tmpfile_path]
-                }]
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": "Проанализируй кадр и предоставь информацию согласно формату.", "images": [tmpfile_path]}
+            ]
         )
         os.unlink(tmpfile_path)
+
         return response.get("message", {}).get("content", "Нет содержания в ответе")
+
     except Exception as e:
         logger.error(f"Ошибка анализа через Ollama: {e}")
         return f"Ошибка анализа: {e}"
 
-def rerank_chunks(query, chunks):
-    """
-    Реранкинг чанков с использованием CrossEncoder.
-    """
-    # Формируем пары [query, chunk]
-    pairs = [[query, chunk] for chunk in chunks]
-    # Получаем оценки релевантности
-    scores = reranker.predict(pairs)
-    # Сортируем чанки по убыванию релевантности
-    ranked_chunks = [chunk for _, chunk in sorted(zip(scores, chunks), reverse=True)]
-    return ranked_chunks
-
-
-def vec_search(query, n_top=50):
-    query_emb = bi_encoder.encode([query]).tolist()[0]
-    results = qdrant_client.search(
-        collection_name=COLL_NAME,
-        query_vector=query_emb,
-        limit=n_top
-    )
-    chunks = [hit.payload['chunk'] for hit in results]
-    ranked_chunks = rerank_chunks(query, chunks)
-    return ranked_chunks
-
-
-# === Поиск в Qdrant и ответ от Mistral ===
+# === Поиск в Qdrant и ответ от модели Mistral 7B ===
 @app.route('/ask_model', methods=['POST'])
 def ask_model():
     data = request.get_json()
     query = data.get("question", "")
     current_time = data.get("time", "")
-    
-
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if not current_time else current_time
     if not query:
         return jsonify({"error": "No question provided"}), 400
 
     try:
-        # Формируем временной диапазон
-        
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if not current_time else current_time
-
+        query_emb = bi_encoder.encode(query).tolist()
         results = qdrant_client.search(
             collection_name=COLL_NAME,
-            query_vector=bi_encoder.encode([query]).tolist()[0],
-            limit=50
+            query_vector=query_emb,
+            limit=3
         )
 
-        # Извлечение чанков и метаданных
-        chunks = [hit.payload['chunk'] for hit in results]
-
-        # Реранкинг чанков
-        ranked_chunks = rerank_chunks(query, chunks)
-
-        # Формирование контекста
-        context = "\n".join(ranked_chunks[:7])
-
-        full_prompt = f"""
+        context = "\n".join([hit.payload['chunk'] for hit in results])
+        prompt = f"""
 Ты — виртуальный ассистент охранника , установленный на контрольно-наблюдательном посту. Твоя задача — помогать охраннику следить за безопасностью на территории, анализировать видеопоток с камер, фиксировать подозрительные события, отвечать на вопросы по обстановке и предоставлять краткие логические выводы.
 Ты подключен к системе видеонаблюдения и можешь описывать происходящее на любой из камер, анализировать изменения в обстановке, выделять важные события и своевременно информировать персонал
 
@@ -495,13 +375,12 @@ def ask_model():
 ==========
 """
 
-        response = client.chat.completions.create(model=MISTRAL_MODEL, messages=[
-            {"role": "system", "content": "Вы — полезный ассистент, говорящий на русском языке."},
-            {"role": "user", "content": full_prompt}],
-            temperature=0.7
-            )
+        response = ollama.chat(model=MISTRAL_MODEL, messages=[
+            {"role": "system", "content": "Вы — полезный ассистент."},
+            {"role": "user", "content": prompt}
+        ])
 
-        return jsonify({"answer": response.choices[0].message.content})
+        return jsonify({"answer": response['message']['content']})
     except Exception as e:
         logger.error(f"Ошибка при генерации ответа: {e}")
         return jsonify({"error": "Internal server error"}), 500
@@ -528,7 +407,7 @@ def camera_processing_thread(camera_name, camera_url):
             time.sleep(5)
             continue
 
-        results = local_model.track(frame, persist=True, verbose=False, tracker="bytetrack.yaml", conf=0.6)
+        results = local_model.track(frame, persist=True, verbose=False, tracker="bytetrack.yaml", conf=0.2)
         detections = []
         if results and hasattr(results[0], 'boxes'):
             for obj in results[0].boxes:
@@ -545,12 +424,15 @@ def camera_processing_thread(camera_name, camera_url):
                 x, y, w, h = obj_data['bbox']
                 obj_frame = frame[y:y+h, x:x+w]
                 with question_lock:
-                    description = analyze_frame_with_ollama(obj_frame, camera_name, obj_id)
+                    description = analyze_frame_with_ollama(obj_frame, camera_name=camera_name, obj_id=obj_id, obj_type=obj_data['label'])
                 log_analysis(camera_name, obj_id, obj_data['label'], description)
                 obj_data['analyzed'] = True
                 tracker.active_objects[obj_id] = obj_data
 
-        annotated_frame = results[0].plot() if results else frame.copy()
+        if results and hasattr(results[0], 'boxes'):
+            annotated_frame = results[0].plot()
+        else:
+            annotated_frame = frame.copy()
         with lock_objects[camera_name]:
             latest_frames[camera_name] = annotated_frame
         time.sleep(0.03)
@@ -646,10 +528,79 @@ try:
             vectors_config=VectorParams(size=bi_encoder_dim, distance=Distance.COSINE)
         )
         logger.info(f"Коллекция '{COLL_NAME}' создана в Qdrant")
+    else:
+        logger.info(f"Коллекция '{COLL_NAME}' уже существует")
 except Exception as e:
     logger.error(f"Ошибка проверки коллекции Qdrant: {e}")
 
-# === Запуск потоков камер ===
+# === Класс трекера ===
+class UniqueObjectTracker:
+    def __init__(self, max_age=10):
+        self.active_objects = {}
+        self.max_age = max_age
+        self.next_id = 0
+
+    def register(self, bbox):
+        self.active_objects[self.next_id] = {
+            'bbox': bbox,
+            'first_seen': datetime.now(),
+            'last_seen': datetime.now(),
+            'analyzed': False,
+            'type': None
+        }
+        obj_id = self.next_id
+        self.next_id += 1
+        return obj_id
+
+    def update(self, detections):
+        updated = {}
+        for det_bbox, label in detections:
+            matched = False
+            for obj_id, obj_data in list(self.active_objects.items()):
+                if self.iou(det_bbox, obj_data['bbox']) > 0.3:
+                    updated[obj_id] = {
+                        'bbox': det_bbox,
+                        'first_seen': obj_data['first_seen'],
+                        'last_seen': datetime.now(),
+                        'label': label,
+                        'analyzed': obj_data['analyzed'],
+                        'type': label
+                    }
+                    matched = True
+                    break
+            if not matched:
+                new_id = self.register(det_bbox)
+                updated[new_id] = {
+                    'bbox': det_bbox,
+                    'first_seen': datetime.now(),
+                    'last_seen': datetime.now(),
+                    'label': label,
+                    'analyzed': False,
+                    'type': label
+                }
+
+        now = datetime.now()
+        for obj_id in list(self.active_objects.keys()):
+            if obj_id not in updated and (now - self.active_objects[obj_id]['last_seen']).total_seconds() < self.max_age:
+                updated[obj_id] = self.active_objects[obj_id]
+
+        self.active_objects = updated
+        return self.active_objects
+
+    def iou(self, box1, box2):
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+        xA = max(x1, x2)
+        yA = max(y1, y2)
+        xB = min(x1 + w1, x2 + w2)
+        yB = min(y1 + h1, y2 + h2)
+        interArea = max(0, xB - xA) * max(0, yB - yA)
+        box1Area = w1 * h1
+        box2Area = w2 * h1
+        union = box1Area + box2Area - interArea
+        return interArea / union if union != 0 else 0
+
+# === Запуск камер ===
 for camera_name, camera_url in CAMERAS.items():
     thread = threading.Thread(
         target=camera_processing_thread,
@@ -659,5 +610,6 @@ for camera_name, camera_url in CAMERAS.items():
     thread.start()
     camera_threads[camera_name] = thread
 
+# === Запуск Flask ===
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8090, debug=True)
